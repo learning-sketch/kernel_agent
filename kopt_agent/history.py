@@ -20,7 +20,11 @@ class History:
         self.best: tuple[Candidate, TrialResult] | None = None
 
     def record(self, candidate: Candidate, result: TrialResult) -> bool:
-        """Store the trial. Returns True when this trial became the new best."""
+        """Store the trial. Returns True when this trial became the new best.
+
+        Only benchmark-grade (full timing) results can become the best: quick screening
+        timings are too noisy to rank the winner.
+        """
         self.records.append((candidate, result))
         self.fingerprints.add(candidate.fingerprint)
         with self.trials_path.open("a", encoding="utf-8") as handle:
@@ -30,7 +34,7 @@ class History:
             candidate.source, encoding="utf-8"
         )
 
-        if not result.is_valid:
+        if not result.is_benchmark_grade:
             return False
         if self.best is None or result.latency_ms_median < self.best[1].latency_ms_median:
             self.best = (candidate, result)
@@ -44,18 +48,24 @@ class History:
             counts[result.status.value] += 1
         return counts
 
+    def valid_results(self, origins: tuple[str, ...] | None = None) -> list[TrialResult]:
+        results = [result for _, result in self.records if result.is_valid and (origins is None or result.origin in origins)]
+        return sorted(results, key=lambda result: result.latency_ms_median)
+
     def leaderboard(self, limit: int = 10) -> str:
-        valid = sorted((result for _, result in self.records if result.is_valid), key=lambda r: r.latency_ms_median)
+        valid = self.valid_results()
         if not valid:
             return "no correct kernel found"
         baseline = next((result for _, result in self.records if result.is_valid and result.origin == "baseline"), None)
-        header = f"{'#':>3} {'trial':>5} {'latency ms':>11} {'GFLOP/s':>9} {'GB/s':>8} {'speedup':>8}  candidate"
+        header = f"{'#':>3} {'trial':>5} {'latency ms':>11} {'GFLOP/s':>9} {'GB/s':>8} {'speedup':>8} {'roof%':>6}  candidate"
         lines = [header, "-" * len(header)]
         for rank, result in enumerate(valid[:limit], start=1):
             speedup = baseline.latency_ms_median / result.latency_ms_median if baseline else float("nan")
+            roof = f"{result.roofline['fraction_of_attainable'] * 100:5.0f}%" if result.roofline else "   n/a"
+            tier = "" if result.timing_tier == "full" else " (quick)"
             lines.append(
                 f"{rank:>3} {result.trial_id:>5} {result.latency_ms_median:>11.4f} {result.gflops:>9.1f} "
-                f"{result.gbps:>8.1f} {speedup:>7.2f}x  {result.candidate_label}"
+                f"{result.gbps:>8.1f} {speedup:>7.2f}x {roof}  {result.candidate_label}{tier}"
             )
         return "\n".join(lines)
 

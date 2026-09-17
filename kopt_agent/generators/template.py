@@ -45,6 +45,35 @@ class TemplateGenerator:
             total *= len(values)
         return total
 
+    def signature(self, params: Params) -> tuple:
+        merged = {**self.default_params, **params}
+        return tuple(str(merged[key]) for key in self.space)
+
+    def mutate(self, parent: Params, rng: random.Random, seen: set[tuple], attempts: int = 32) -> Params | None:
+        """Neighbourhood move: shift one or two knobs to an adjacent value in their option list
+        (so tile sizes double/halve rather than jump), occasionally re-draw a knob at random.
+        Returns None if no unseen, constraint-satisfying neighbour is found."""
+        keys = list(self.space)
+        merged_parent = {**self.default_params, **parent}
+        for _ in range(attempts):
+            child = dict(merged_parent)
+            for key in rng.sample(keys, k=min(len(keys), rng.choice((1, 1, 2)))):
+                options = self.space[key]
+                if len(options) < 2:
+                    continue
+                if rng.random() < 0.25 or child[key] not in options:
+                    child[key] = rng.choice(options)
+                else:
+                    index = options.index(child[key])
+                    step = rng.choice((-1, 1))
+                    child[key] = options[min(max(index + step, 0), len(options) - 1)]
+            child = {key: child[key] for key in keys}
+            signature = self.signature(child)
+            if signature in seen or not self.constraint(child):
+                continue
+            return child
+        return None
+
     def iter_configs(self, budget: int, rng: random.Random) -> Iterator[Params]:
         """Yield up to `budget` distinct configurations satisfying the constraint.
 
