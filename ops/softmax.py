@@ -107,8 +107,10 @@ def _reference(inputs, scalars) -> np.ndarray:
 
 
 def _generate_input(tensor: TensorSpec, rng: np.random.Generator) -> np.ndarray:
-    # Wide dynamic range (logits up to ~+-90) so exp() without max-subtraction overflows float32.
-    values = rng.standard_normal(tensor.shape) * 30.0
+    # Realistic logit spread; the +-88 sentinels make exp() without max-subtraction overflow float32.
+    # (A much wider spread would push most exp() results into denormals and benchmark the FPU
+    # denormal path instead of the kernel.)
+    values = rng.standard_normal(tensor.shape) * 8.0
     if tensor.shape[0] > 1 and tensor.shape[1] > 1:
         values[0, 0] = 88.0
         values[-1, -1] = -88.0
@@ -150,4 +152,4 @@ def build(shape: tuple[int, ...]) -> OperatorBundle:
         default_params={"THREADS": os.cpu_count() or 1, "SCHEDULE": "static", "CHUNK": 16, "ONLINE": 0, "FASTMATH": 0},
         extra_flags=lambda params: ("-ffast-math",) if int(params["FASTMATH"]) else (),
     )
-    return OperatorBundle(spec=spec, baseline_source=BASELINE_SOURCE, template=template)
+    return OperatorBundle(spec=spec, baseline_source=BASELINE_SOURCE, templates={"rows": template}, default_template="rows")

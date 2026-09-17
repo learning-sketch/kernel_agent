@@ -9,6 +9,7 @@ import numpy as np
 from kopt_agent.agent import OperatorBundle
 from kopt_agent.generators.template import TemplateGenerator
 from kopt_agent.spec import OperatorSpec, TensorSpec, TestCase
+from ops.matmul_packed import build_packed_template
 
 DEFAULT_SHAPE = (512, 512, 512)
 SYMBOL = "matmul_kernel"
@@ -109,7 +110,7 @@ def build(shape: tuple[int, ...]) -> OperatorBundle:
     )
 
     thread_options = sorted({1, 2, max(1, (os.cpu_count() or 1) // 2), os.cpu_count() or 1})
-    template = TemplateGenerator(
+    blocked_template = TemplateGenerator(
         template_source=TEMPLATE_SOURCE,
         space={
             "MB": [8, 16, 32, 64],
@@ -122,4 +123,9 @@ def build(shape: tuple[int, ...]) -> OperatorBundle:
         # A tile of B (KB x NB floats) plus a row strip of C should stay inside L2.
         constraint=lambda params: int(params["KB"]) * int(params["NB"]) * 4 <= 512 * 1024,
     )
-    return OperatorBundle(spec=spec, baseline_source=BASELINE_SOURCE, template=template)
+    return OperatorBundle(
+        spec=spec,
+        baseline_source=BASELINE_SOURCE,
+        templates={"packed": build_packed_template(SIGNATURE), "blocked": blocked_template},
+        default_template="packed",
+    )
