@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Sequence
@@ -25,6 +27,10 @@ from kopt_agent.hardware import describe_cpu
 from kopt_agent.spec import OperatorSpec, TestCase
 
 DEFAULT_FLAGS = ("-O3", "-march=native", "-fopenmp", "-shared", "-fPIC")
+# gcc's vectorizer diagnostics: which loops were vectorized and, more usefully, why others were not.
+OPT_REPORT_FLAGS = ("-fopt-info-vec-missed", "-fopt-info-vec-optimized")
+OPT_REPORT_PATTERN = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+): (?P<kind>missed|optimized): (?P<text>.+)$", re.MULTILINE)
+MAX_OPT_REPORT_LINES = 40
 # Libraries go after the sources so --as-needed keeps them (libmvec backs vectorized expf/logf under -ffast-math).
 BASE_LINK_LIBS = ("-lm",)
 OPTIONAL_LINK_LIBS = ("-lmvec",)
@@ -48,6 +54,7 @@ class CpuCBackend(Backend):
         self.compile_timeout_seconds = compile_timeout_seconds
         self.threads = threads or os.cpu_count() or 1
         self._artifact_cache: dict[str, CompileResult] = {}
+        self._cache_lock = threading.Lock()
         self.link_libs = BASE_LINK_LIBS + tuple(lib for lib in OPTIONAL_LINK_LIBS if self._library_links(lib))
 
     def _library_links(self, library_flag: str) -> bool:
@@ -64,7 +71,8 @@ class CpuCBackend(Backend):
         return completed.returncode == 0
 
     def compile(self, candidate: Candidate, spec: OperatorSpec) -> CompileResult:
-        cached = self._artifact_cache.get(candidate.fingerprint)
+        with self._cache_lock:
+            cached = self._artifact_cache.get(candidate.fingerprint)
         if cached is not None:
             return cached
 
@@ -72,7 +80,10 @@ class CpuCBackend(Backend):
         artifact_path = source_path.with_suffix(".so")
         source_path.write_text(candidate.source, encoding="utf-8")
 
-        command = [self.compiler, *DEFAULT_FLAGS, *candidate.extra_compile_flags, str(source_path), *self.link_libs, "-o", str(artifact_path)]
+        command = [
+            self.compiler, *DEFAULT_FLAGS, *OPT_REPORT_FLAGS, *candidate.extra_compile_flags,
+            str(source_path), *self.link_libs, "-o", str(artifact_path),
+        ]
         started = time.perf_counter()
         try:
             completed = subprocess.run(
@@ -80,16 +91,19 @@ class CpuCBackend(Backend):
             )
         except subprocess.TimeoutExpired:
             result = CompileResult(False, None, f"compiler timed out after {self.compile_timeout_seconds:.0f}s", 0.0)
-            self._artifact_cache[candidate.fingerprint] = result
+            with self._cache_lock:
+                self._artifact_cache[candidate.fingerprint] = result
             return result
 
         elapsed = time.perf_counter() - started
-        log = (completed.stderr or "") + (completed.stdout or "")
+        raw_log = (completed.stderr or "") + (completed.stdout or "")
+        report, log = _split_optimization_report(raw_log, candidate.source)
         if completed.returncode != 0 or not artifact_path.exists():
             result = CompileResult(False, None, log.strip() or f"compiler exited with {completed.returncode}", elapsed)
         else:
-            result = CompileResult(True, artifact_path, log.strip(), elapsed)
-        self._artifact_cache[candidate.fingerprint] = result
+            result = CompileResult(True, artifact_path, log.strip(), elapsed, optimization_report=report)
+        with self._cache_lock:
+            self._artifact_cache[candidate.fingerprint] = result
         return result
 
     def run(
@@ -171,6 +185,25 @@ class CpuCBackend(Backend):
             "Do NOT define main(). Do not read files or environment variables. Every input pointer is "
             "row-major, contiguous, 64-byte aligned. Row strides equal the logical dimensions."
         )
+
+
+def _split_optimization_report(raw_log: str, source: str) -> tuple[list[str], str]:
+    """Separate gcc's vectorizer notes from real diagnostics and attach the offending source line."""
+    source_lines = source.splitlines()
+    report: list[str] = []
+    seen: set[str] = set()
+    for match in OPT_REPORT_PATTERN.finditer(raw_log):
+        line_number = int(match.group("line"))
+        snippet = source_lines[line_number - 1].strip() if 0 < line_number <= len(source_lines) else ""
+        entry = f"line {line_number} [{match.group('kind')}] {match.group('text').strip()}" + (f"  // {snippet[:80]}" if snippet else "")
+        if entry not in seen:
+            seen.add(entry)
+            report.append(entry)
+    remaining = OPT_REPORT_PATTERN.sub("", raw_log)
+    remaining = "\n".join(line for line in remaining.splitlines() if line.strip())
+    if len(report) > MAX_OPT_REPORT_LINES:
+        report = report[:MAX_OPT_REPORT_LINES] + [f"... {len(report) - MAX_OPT_REPORT_LINES} more vectorizer notes omitted"]
+    return report, remaining
 
 
 def _describe_crash(returncode: int, stderr: str) -> str:

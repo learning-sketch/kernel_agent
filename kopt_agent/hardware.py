@@ -22,7 +22,7 @@ def _cpu_model() -> str:
     return platform.processor() or platform.machine()
 
 
-def _cpu_flags() -> list[str]:
+def cpu_flags() -> list[str]:
     try:
         with open("/proc/cpuinfo", encoding="utf-8") as handle:
             for line in handle:
@@ -47,8 +47,12 @@ def _caches() -> str:
 
 def describe_cpu(threads: int | None = None) -> str:
     thread_count = threads or os.cpu_count() or 1
-    flags = _cpu_flags()
+    flags = cpu_flags()
     return (
         f"CPU: {_cpu_model()}; usable threads: {thread_count}; "
         f"SIMD: {', '.join(flags) if flags else 'unknown'}; caches: {_caches()}"
     )
+
+
+def supports_avx512() -> bool:
+    return "avx512f" in cpu_flags()

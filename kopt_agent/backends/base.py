@@ -20,6 +20,8 @@ class CompileResult:
     artifact: Path | None = None
     log: str = ""
     compile_seconds: float = 0.0
+    # Compiler notes about which loops were (not) vectorized; fed back to the LLM.
+    optimization_report: list[str] = field(default_factory=list)
 
 
 @dataclass
