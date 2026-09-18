@@ -100,6 +100,12 @@ class OptimizationAgent:
         self.config = config
         self.llm = llm
         self.template = bundle.select_template(config.template_name)
+        if not backend.supports_dtype(self.spec.dtype):
+            raise RuntimeError(
+                f"backend '{backend.name}' cannot compile {self.spec.dtype.name} kernels on this machine "
+                f"(the compiler rejects the C type '{self.spec.dtype.c_type}'; gcc >= 12 for _Float16, >= 13 for __bf16). "
+                "Use --dtype fp32 or a newer toolchain."
+            )
         self.hardware = backend.hardware_summary()
         self.peaks: MachinePeaks | None = None
         if config.roofline:

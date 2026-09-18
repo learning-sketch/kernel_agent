@@ -315,7 +315,7 @@ def _describe_measurement(result: TrialResult) -> str:
             f"Roofline: {roof['bound']}-bound at this shape (arithmetic intensity {roof['arithmetic_intensity']:.1f} FLOP/B); "
             f"this kernel reaches {roof['fraction_of_attainable'] * 100:.0f}% of the attainable {roof['attainable_ms']:.4f} ms "
             f"({roof['fraction_of_compute_peak'] * 100:.0f}% of FMA peak, {roof['fraction_of_bandwidth_peak'] * 100:.0f}% of bandwidth peak, "
-            f"call floor {roof["overhead_ms"]:.4f} ms)."
+            f"call floor {roof['overhead_ms']:.4f} ms)."
         )
     if result.ab_speedup:
         lines.append(f"Interleaved A/B against the baseline in the same process: {result.ab_speedup:.2f}x.")

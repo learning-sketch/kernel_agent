@@ -13,6 +13,18 @@ from kopt_agent.candidate import Candidate
 Params = dict[str, object]
 
 
+def template_identifiers(template: Template) -> set[str]:
+    """Placeholder names of a string.Template (Template.get_identifiers exists only on 3.11+)."""
+    names: set[str] = set()
+    for match in template.pattern.finditer(template.template):
+        name = match.group("named") or match.group("braced")
+        if name is not None:
+            names.add(name)
+        elif match.group("invalid") is not None:
+            raise ValueError(f"invalid placeholder in template at offset {match.start()}")
+    return names
+
+
 class TemplateGenerator:
     def __init__(
         self,
@@ -30,7 +42,7 @@ class TemplateGenerator:
         self.extra_flags = extra_flags or (lambda _params: ())
         # Optional: the activation predicate of the fast path a configuration enables (None = no fast path).
         self.fast_path = fast_path or (lambda _params: None)
-        missing = set(self.template.get_identifiers()) - set(default_params)
+        missing = template_identifiers(self.template) - set(default_params)
         if missing:
             raise ValueError(f"template placeholders without defaults: {sorted(missing)}")
 

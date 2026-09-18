@@ -50,6 +50,8 @@ def test_bf16_encode_decode_round_trips_with_rne():
 
 @pytest.mark.parametrize("dtype", ["fp16", "bf16"])
 def test_16bit_matmul_baseline_and_template_are_graded(backend, dtype):
+    if not backend.supports_dtype(get_dtype(dtype)):
+        pytest.skip(f"this compiler does not support the C type for {dtype}")
     bundle = build_operator("matmul", (40, 48, 32), dtype=dtype)
     evaluator = Evaluator(bundle.spec, backend, warmup=1, repeats=2, run_timeout_seconds=10)
     baseline = evaluator.evaluate(Candidate(source=bundle.baseline_source, origin="baseline"))
@@ -58,6 +60,15 @@ def test_16bit_matmul_baseline_and_template_are_graded(backend, dtype):
     tuned = evaluator.evaluate(bundle.select_template(None).default_candidate())
     assert tuned.status is TrialStatus.OK, tuned.message
     assert tuned.scaled_ulp_error is not None and tuned.bitwise_match_rate is not None
+
+
+def test_agent_refuses_dtype_the_toolchain_cannot_compile(backend, tmp_path, monkeypatch):
+    from kopt_agent.agent import AgentConfig, OptimizationAgent
+
+    monkeypatch.setattr(backend, "supports_dtype", lambda dtype: dtype.name == "fp32")
+    bundle = build_operator("matmul", (8, 8, 8), dtype="bf16")
+    with pytest.raises(RuntimeError, match="cannot compile bf16"):
+        OptimizationAgent(bundle, backend, AgentConfig(roofline=False, output_dir=tmp_path))
 
 
 def test_faster_but_sloppy_kernel_is_graded_reduced_precision(matmul):

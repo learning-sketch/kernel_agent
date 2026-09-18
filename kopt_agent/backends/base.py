@@ -11,6 +11,7 @@ from typing import Sequence
 import numpy as np
 
 from kopt_agent.candidate import Candidate
+from kopt_agent.dtypes import DType
 from kopt_agent.spec import OperatorSpec, TestCase
 
 
@@ -123,6 +124,11 @@ class Backend(ABC):
 
     @abstractmethod
     def hardware_summary(self) -> str: ...
+
+    def supports_dtype(self, dtype: DType) -> bool:
+        """Whether this backend's toolchain can compile kernels over `dtype` (e.g. _Float16 / __bf16
+        need a recent gcc/clang on x86). fp32 is always expected to work."""
+        return dtype.name == "fp32"
 
     @abstractmethod
     def language_guidance(self) -> str:

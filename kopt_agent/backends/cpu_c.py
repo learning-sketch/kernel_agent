@@ -23,6 +23,7 @@ import numpy as np
 
 from kopt_agent.backends.base import Backend, CompileResult, ProfileReport, RunResult
 from kopt_agent.candidate import Candidate
+from kopt_agent.dtypes import DType
 from kopt_agent.hardware import describe_cpu
 from kopt_agent.spec import OperatorSpec, TestCase
 
@@ -56,6 +57,32 @@ class CpuCBackend(Backend):
         self._artifact_cache: dict[str, CompileResult] = {}
         self._cache_lock = threading.Lock()
         self.link_libs = BASE_LINK_LIBS + tuple(lib for lib in OPTIONAL_LINK_LIBS if self._library_links(lib))
+        self._dtype_support: dict[str, bool] = {}
+
+    def supports_dtype(self, dtype: DType) -> bool:
+        """Probe once whether the compiler accepts the element type with float conversions
+        (gcc >= 12 for _Float16, gcc >= 13 for __bf16 on x86)."""
+        if dtype.name == "fp32":
+            return True
+        cached = self._dtype_support.get(dtype.name)
+        if cached is not None:
+            return cached
+        probe_source = self.work_dir / f"probe_{dtype.name}.c"
+        probe_source.write_text(
+            f"float kopt_probe_load(const {dtype.c_type}* p) {{ return (float)p[0] + 1.0f; }}\n"
+            f"void kopt_probe_store({dtype.c_type}* p, float v) {{ p[0] = ({dtype.c_type})v; }}\n",
+            encoding="utf-8",
+        )
+        try:
+            completed = subprocess.run(
+                [self.compiler, *DEFAULT_FLAGS, str(probe_source), "-o", str(probe_source.with_suffix(".so"))],
+                capture_output=True, text=True, timeout=self.compile_timeout_seconds, check=False,
+            )
+            supported = completed.returncode == 0
+        except subprocess.TimeoutExpired:
+            supported = False
+        self._dtype_support[dtype.name] = supported
+        return supported
 
     def _library_links(self, library_flag: str) -> bool:
         probe_source = self.work_dir / "probe.c"
