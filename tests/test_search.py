@@ -76,11 +76,12 @@ def test_knowledge_base_survives_corrupt_lines(tmp_path):
 
 
 def test_roofline_analysis_classifies_bound():
-    peaks = MachinePeaks(compute_gflops=1000.0, bandwidth_gbps=100.0, source="test")
-    compute_bound = analyze(peaks, flops=2 * 512**3, bytes_moved=3 * 512 * 512 * 4, attained_gflops=500.0, attained_gbps=5.0)
+    peaks = MachinePeaks(compute_gflops=1000.0, bandwidth_gbps=100.0, dispatch_overhead_ms=0.001, call_overhead_ms=0.0002, source="test")
+    flops, bytes_moved = 2 * 512**3, 3 * 512 * 512 * 4
+    compute_bound = analyze(peaks, flops=flops, bytes_moved=bytes_moved, measured_ms=2 * (flops / 1000.0 / 1e6 + 0.0002))
     assert compute_bound.bound == "compute"
     assert abs(compute_bound.fraction_of_attainable - 0.5) < 1e-9
-    memory_bound = analyze(peaks, flops=5 * 4096 * 1024, bytes_moved=8 * 4096 * 1024, attained_gflops=25.0, attained_gbps=40.0)
+    memory_bound = analyze(peaks, flops=5 * 4096 * 1024, bytes_moved=8 * 4096 * 1024, measured_ms=1.0)
     assert memory_bound.bound == "memory"
-    assert abs(memory_bound.attainable_gflops - 62.5) < 1e-9
-    assert abs(memory_bound.fraction_of_attainable - 0.4) < 1e-9
+    assert memory_bound.memory_time_ms > memory_bound.compute_time_ms
+    assert memory_bound.headroom_speedup > 1.0
