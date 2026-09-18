@@ -21,12 +21,15 @@ class TemplateGenerator:
         default_params: Params,
         constraint: Callable[[Params], bool] | None = None,
         extra_flags: Callable[[Params], tuple[str, ...]] | None = None,
+        fast_path: Callable[[Params], str | None] | None = None,
     ) -> None:
         self.template = Template(template_source)
         self.space = space
         self.default_params = default_params
         self.constraint = constraint or (lambda _params: True)
         self.extra_flags = extra_flags or (lambda _params: ())
+        # Optional: the activation predicate of the fast path a configuration enables (None = no fast path).
+        self.fast_path = fast_path or (lambda _params: None)
         missing = set(self.template.get_identifiers()) - set(default_params)
         if missing:
             raise ValueError(f"template placeholders without defaults: {sorted(missing)}")
@@ -34,7 +37,10 @@ class TemplateGenerator:
     def render(self, params: Params, origin: str = "autotune") -> Candidate:
         merged = {**self.default_params, **params}
         source = self.template.substitute({key: str(value) for key, value in merged.items()})
-        return Candidate(source=source, origin=origin, params=dict(params), extra_compile_flags=self.extra_flags(merged))
+        return Candidate(
+            source=source, origin=origin, params=dict(params), extra_compile_flags=self.extra_flags(merged),
+            fast_path_predicate=self.fast_path(merged),
+        )
 
     def default_candidate(self) -> Candidate:
         return self.render(dict(self.default_params), origin="template-default")

@@ -21,7 +21,7 @@ from typing import Sequence
 
 import numpy as np
 
-from kopt_agent.backends.base import Backend, CompileResult, RunResult
+from kopt_agent.backends.base import Backend, CompileResult, ProfileReport, RunResult
 from kopt_agent.candidate import Candidate
 from kopt_agent.hardware import describe_cpu
 from kopt_agent.spec import OperatorSpec, TestCase
@@ -70,6 +70,10 @@ class CpuCBackend(Backend):
             return False
         return completed.returncode == 0
 
+    def portable_compile_command(self) -> list[str]:
+        """Command template (with {source} / {artifact} placeholders) for the emitted parity test."""
+        return ["gcc", *DEFAULT_FLAGS, "{source}", *self.link_libs, "-o", "{artifact}"]
+
     def compile(self, candidate: Candidate, spec: OperatorSpec) -> CompileResult:
         with self._cache_lock:
             cached = self._artifact_cache.get(candidate.fingerprint)
@@ -101,7 +105,7 @@ class CpuCBackend(Backend):
         if completed.returncode != 0 or not artifact_path.exists():
             result = CompileResult(False, None, log.strip() or f"compiler exited with {completed.returncode}", elapsed)
         else:
-            result = CompileResult(True, artifact_path, log.strip(), elapsed, optimization_report=report)
+            result = CompileResult(True, artifact_path, log.strip(), elapsed, optimization_report=report, profile=_profile_from_report(report))
         with self._cache_lock:
             self._artifact_cache[candidate.fingerprint] = result
         return result
@@ -115,10 +119,13 @@ class CpuCBackend(Backend):
         warmup: int,
         repeats: int,
         timeout_seconds: float,
+        verify: bool = True,
+        reference_artifact: Path | None = None,
     ) -> RunResult:
         job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=self.work_dir))
         inputs_path = job_dir / "inputs.npz"
         output_path = job_dir / "output.npy"
+        poison_output_path = job_dir / "output_poison.npy"
         np.savez(inputs_path, **{tensor.name: array for tensor, array in zip(case.inputs, inputs)})
 
         job = {
@@ -127,11 +134,14 @@ class CpuCBackend(Backend):
             "inputs_path": str(inputs_path),
             "input_names": [tensor.name for tensor in case.inputs],
             "output_shape": list(case.output.shape),
-            "output_dtype": np.dtype(case.output.dtype).str,
+            "output_dtype": np.dtype(case.output.dtype.storage).str,
             "scalars": list(case.scalars),
             "warmup": warmup,
             "repeats": repeats,
+            "verify": verify,
             "output_path": str(output_path),
+            "poison_output_path": str(poison_output_path),
+            "ab": {"artifact": str(reference_artifact), "symbol": spec.symbol} if reference_artifact else None,
         }
         env = dict(os.environ)
         env.setdefault("OMP_NUM_THREADS", str(self.threads))
@@ -169,9 +179,22 @@ class CpuCBackend(Backend):
             shutil.rmtree(job_dir, ignore_errors=True)
             return RunResult(False, error=payload.get("error", "unknown runner error"), error_kind=payload.get("error_kind", "runtime"))
 
-        output = np.load(output_path)
+        output = np.load(output_path) if verify and output_path.exists() else None
+        poison_output = np.load(poison_output_path) if poison_output_path.exists() else None
         shutil.rmtree(job_dir, ignore_errors=True)
-        return RunResult(True, output=output, timings_ms=payload.get("timings_ms", []))
+        return RunResult(
+            True,
+            output=output,
+            timings_ms=payload.get("timings_ms", []),
+            host_timings_ms=payload.get("host_timings_ms", []),
+            reference_timings_ms=payload.get("reference_timings_ms", []),
+            cpu_wall_ratio=payload.get("cpu_wall_ratio"),
+            threads_available=payload.get("threads_available"),
+            fast_path_active=payload.get("fast_path_active"),
+            poison_left_in_output=bool(payload.get("poison_left_in_output", False)),
+            prefill_dependent=bool(payload.get("prefill_dependent", False)),
+            poison_output=poison_output,
+        )
 
     def hardware_summary(self) -> str:
         return describe_cpu(self.threads)
@@ -183,7 +206,14 @@ class CpuCBackend(Backend):
             + ". You may use OpenMP (#include <omp.h>), <immintrin.h> intrinsics that match the CPU flags "
             "listed in the hardware summary, <math.h>, <string.h>, <stdint.h>, <stdlib.h>. "
             "Do NOT define main(). Do not read files or environment variables. Every input pointer is "
-            "row-major, contiguous, 64-byte aligned. Row strides equal the logical dimensions."
+            "row-major, contiguous, 64-byte aligned. Row strides equal the logical dimensions. "
+            "16-bit element types are spelled _Float16 (fp16) and __bf16 (bf16); convert to float for arithmetic. "
+            "If your kernel has a fast path that only handles some inputs (alignment, multiples of a tile, "
+            "size thresholds), you MUST (a) keep a correct fallback for every other input, (b) declare the "
+            "activation condition as a comment `// fast_path: <expression over the int scalars>` and (c) "
+            "export `int kopt_fast_path_active;` at file scope and set it to 1 when the fast path ran and 0 "
+            "otherwise. The harness checks both that the fast path really activates on matching inputs and "
+            "that the fallback is correct on the others."
         )
 
 
@@ -204,6 +234,25 @@ def _split_optimization_report(raw_log: str, source: str) -> tuple[list[str], st
     if len(report) > MAX_OPT_REPORT_LINES:
         report = report[:MAX_OPT_REPORT_LINES] + [f"... {len(report) - MAX_OPT_REPORT_LINES} more vectorizer notes omitted"]
     return report, remaining
+
+
+VECTOR_WIDTH_PATTERN = re.compile(r"using (\d+) byte vectors")
+
+
+def _profile_from_report(report: list[str]) -> ProfileReport:
+    """Turn gcc's vectorizer notes into the backend-neutral schema."""
+    profile = ProfileReport()
+    widest = 0
+    for entry in report:
+        if "[optimized]" in entry:
+            match = VECTOR_WIDTH_PATTERN.search(entry)
+            if match:
+                widest = max(widest, int(match.group(1)) * 8)
+            profile.vectorized_loops.append(entry.replace(" [optimized]", ":"))
+        elif "[missed]" in entry and "not vectorized" in entry:
+            profile.missed_loops.append(entry.replace(" [missed]", ":"))
+    profile.vector_width_bits = widest or None
+    return profile
 
 
 def _describe_crash(returncode: int, stderr: str) -> str:

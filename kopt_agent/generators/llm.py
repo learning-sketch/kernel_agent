@@ -16,8 +16,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+from kopt_agent.backends.base import ProfileReport
 from kopt_agent.candidate import Candidate
 from kopt_agent.evaluator import TrialResult, TrialStatus
+from kopt_agent.roofline import Verdict
 from kopt_agent.spec import OperatorSpec
 
 OPTIMIZATION_PLAYBOOK = """Techniques worth considering (pick what the measurements justify):
@@ -35,7 +37,8 @@ SYSTEM_PROMPT = (
     "You are a senior high-performance kernel engineer. You write correct, fast, portable C kernels and "
     "reason from measurements. Respond with exactly one ```c code block containing a complete translation "
     "unit (includes + the required function). No main(), no prose outside the code block, except an optional "
-    "one-line `// strategy: ...` comment at the top of the file."
+    "one-line `// strategy: ...` comment at the top of the file and, if the kernel has a conditional fast path, "
+    "a `// fast_path: <condition over the int scalars>` comment."
 )
 
 
@@ -73,7 +76,7 @@ class RoundFeedback:
 
 
 # Each parallel sample is nudged toward a different part of the design space so best-of-N
-# does not return N near-identical kernels.
+# does not return N near-identical kernels. The roofline verdict picks the family.
 SAMPLE_FOCUS = (
     "",
     "Focus on register blocking: a fixed MRxNR accumulator tile living entirely in vector registers.",
@@ -82,6 +85,29 @@ SAMPLE_FOCUS = (
     "Focus on explicit SIMD intrinsics for the innermost loop and aligned loads/stores.",
     "Focus on minimising memory traffic: fuse passes so each element is read from DRAM once.",
 )
+
+FOCUS_BY_BOUND = {
+    "compute": (
+        "",
+        "Focus on register blocking: a fixed MRxNR accumulator tile living entirely in vector registers.",
+        "Focus on instruction-level parallelism: more independent FMA chains, unrolling, full-width vectors.",
+        "Focus on data layout: pack operand tiles into contiguous aligned scratch buffers before the hot loop.",
+        "Focus on explicit SIMD intrinsics for the innermost loop and aligned loads/stores.",
+    ),
+    "memory": (
+        "",
+        "Focus on minimising bytes moved: fuse passes so each element is read from DRAM once.",
+        "Focus on vectorized, aligned, unit-stride loads/stores and using every thread to saturate bandwidth.",
+        "Focus on cache blocking so reused data stays in L1/L2 between passes.",
+        "Focus on streaming (non-temporal) stores for write-once outputs.",
+    ),
+    "overhead": (
+        "",
+        "Focus on eliminating dispatch overhead: no parallel region below a size threshold, no per-call allocation.",
+        "Focus on batching: process the whole problem in one pass with minimal loop nesting and no barriers.",
+        "Focus on keeping the single-threaded path as lean as possible; the work is tiny.",
+    ),
+}
 
 
 class LLMGenerator:
@@ -101,9 +127,12 @@ class LLMGenerator:
         round_index: int,
         sample_index: int = 0,
         peaks_summary: str = "",
+        verdict: Verdict | None = None,
+        dead_ends: list[str] | None = None,
     ) -> Candidate:
         prompt = self._build_prompt(
-            spec, hardware_summary, language_guidance, best_source, best_result, feedback, round_index, sample_index, peaks_summary
+            spec, hardware_summary, language_guidance, best_source, best_result, feedback, round_index, sample_index,
+            peaks_summary, verdict, dead_ends or [],
         )
         temperature = self.config.temperature if sample_index == 0 else min(1.0, self.config.temperature + 0.3)
         reply = self._chat(prompt, temperature)
@@ -114,7 +143,11 @@ class LLMGenerator:
             raise ValueError(f"model reply does not define the required symbol '{spec.symbol}'")
         strategy_match = re.search(r"//\s*strategy:\s*(.+)", source)
         note = strategy_match.group(1).strip() if strategy_match else ""
-        return Candidate(source=source, origin="llm", params={"round": round_index, "sample": sample_index}, note=note)
+        fast_path_match = re.search(r"//\s*fast_path:\s*(.+)", source)
+        fast_path = fast_path_match.group(1).strip() if fast_path_match else None
+        return Candidate(
+            source=source, origin="llm", params={"round": round_index, "sample": sample_index}, note=note, fast_path_predicate=fast_path
+        )
 
     def propose_many(self, samples: int, **kwargs) -> tuple[list[Candidate], list[str]]:
         """Best-of-N: request `samples` candidates concurrently. Returns (candidates, problems).
@@ -161,19 +194,44 @@ class LLMGenerator:
         round_index: int,
         sample_index: int,
         peaks_summary: str,
+        verdict: Verdict | None,
+        dead_ends: list[str],
     ) -> str:
+        timing_shapes = spec.timing_shapes()
+        if spec.workload is not None:
+            shape_text = (
+                "Workload (the objective is the call-count-weighted total time over these shapes): "
+                + ", ".join(f"{'x'.join(map(str, shape))} x{count} calls" for shape, count in timing_shapes)
+            )
+        else:
+            shape_text = "Benchmark shape: " + "x".join(map(str, spec.primary_shape))
         sections = [
             f"# Operator\n{spec.name}: {spec.description}",
             f"Required prototype (exact):\n```c\n{spec.c_signature};\n```",
-            "Benchmark shape: " + "x".join(map(str, spec.primary_shape))
+            shape_text
             + "; correctness is also checked on edge shapes: "
             + ", ".join("x".join(map(str, shape)) for shape in spec.edge_shapes)
-            + f". Tolerance atol={spec.atol}, rtol={spec.rtol}. Output memory is prefilled with NaN, so every element must be written.",
+            + f". Element type {spec.dtype.name} (C type `{spec.dtype.c_type}`); the reference is computed in fp64 and rounded to "
+            f"{spec.dtype.name}; acceptance atol={spec.atol}, rtol={spec.rtol}; results are graded bitwise-equal / within-N-ULP / "
+            "reduced-precision. Output memory is prefilled with NaN and then with a poison pattern, so every element must be written "
+            "and nothing may be read from the output before writing it."
+            + (
+                " This operator is PRECISION-SENSITIVE: a reduced-precision result cannot win, so do not trade accuracy for speed."
+                if spec.precision_sensitive else ""
+            ),
             "# Hardware\n" + hardware_summary + (f"\nMeasured peaks: {peaks_summary}" if peaks_summary else ""),
             "# Language rules\n" + language_guidance,
         ]
         if spec.notes:
             sections.append("# Operator notes\n- " + "\n- ".join(spec.notes))
+        if spec.fused_stages:
+            sections.append(
+                "# Fusion\nThis is a fused operator composed of the stages: " + " -> ".join(spec.fused_stages)
+                + ". The whole chain must be produced by ONE kernel call; keep intermediates in registers/cache instead of round-tripping through memory."
+            )
+
+        if verdict is not None:
+            sections.append("# Roofline verdict\n" + verdict.describe())
 
         if best_result is not None and best_result.is_valid:
             sections.append(
@@ -188,9 +246,14 @@ class LLMGenerator:
             sections.append(_describe_attempts(feedback.attempts, best_result, round_index))
         if feedback is not None and feedback.extra:
             sections.append("# Feedback\n" + feedback.extra)
+        if dead_ends:
+            sections.append(
+                "# Known dead ends (already tried on this operator/hardware - do NOT propose these again)\n- " + "\n- ".join(dead_ends)
+            )
 
         sections.append("# Playbook\n" + OPTIMIZATION_PLAYBOOK)
-        focus = SAMPLE_FOCUS[sample_index % len(SAMPLE_FOCUS)]
+        focus_options = FOCUS_BY_BOUND.get(verdict.bound, SAMPLE_FOCUS) if verdict is not None else SAMPLE_FOCUS
+        focus = focus_options[sample_index % len(focus_options)]
         sections.append(
             f"# Task (round {round_index}, sample {sample_index})\nProduce a faster kernel than the current best that still passes all checks. "
             + (focus + " " if focus else "")
@@ -232,32 +295,55 @@ class LLMGenerator:
 
 def _describe_measurement(result: TrialResult) -> str:
     lines = [
-        f"median latency {result.latency_ms_median:.4f} ms, {result.gflops:.1f} GFLOP/s, "
-        f"{result.gbps:.1f} GB/s effective bandwidth, max abs error {result.max_abs_error:.3g}."
+        f"median latency {result.latency_ms_median:.4f} ms on the benchmark shape, {result.gflops:.1f} GFLOP/s, "
+        f"{result.gbps:.1f} GB/s effective bandwidth; numeric grade {result.numeric_grade} "
+        f"(max abs error {result.max_abs_error:.3g}, {result.scaled_ulp_error:.1f} scaled ULP)."
     ]
+    if result.per_shape and len(result.per_shape) > 1:
+        lines.append(
+            "Per workload shape: "
+            + "; ".join(
+                f"{'x'.join(map(str, entry['shape']))}: {entry['latency_ms']:.4f} ms x{entry['weight']}"
+                + (f" ({entry['roofline']['bound']}-bound, {entry['roofline']['fraction_of_attainable'] * 100:.0f}% of ceiling)" if entry.get("roofline") else "")
+                for entry in result.per_shape.values()
+            )
+            + f". Weighted objective {result.objective_ms:.4f} ms."
+        )
     if result.roofline:
         roof = result.roofline
         lines.append(
             f"Roofline: {roof['bound']}-bound at this shape (arithmetic intensity {roof['arithmetic_intensity']:.1f} FLOP/B); "
-            f"this kernel reaches {roof['fraction_of_attainable'] * 100:.0f}% of the attainable {roof['attainable_gflops']:.0f} GFLOP/s "
-            f"({roof['fraction_of_compute_peak'] * 100:.0f}% of FMA peak, {roof['fraction_of_bandwidth_peak'] * 100:.0f}% of bandwidth peak)."
+            f"this kernel reaches {roof['fraction_of_attainable'] * 100:.0f}% of the attainable {roof['attainable_ms']:.4f} ms "
+            f"({roof['fraction_of_compute_peak'] * 100:.0f}% of FMA peak, {roof['fraction_of_bandwidth_peak'] * 100:.0f}% of bandwidth peak, "
+            f"call floor {roof["overhead_ms"]:.4f} ms)."
         )
-    if result.compiler_notes:
-        lines.append("Compiler vectorizer report (line numbers refer to the kernel below):\n- " + "\n- ".join(result.compiler_notes[:25]))
+    if result.ab_speedup:
+        lines.append(f"Interleaved A/B against the baseline in the same process: {result.ab_speedup:.2f}x.")
+    if result.thread_utilization is not None:
+        lines.append(
+            f"CPU/wall ratio {result.cpu_wall_ratio:.2f} = {result.thread_utilization * 100:.0f}% of available threads busy"
+            + (" -> host/serial-section bound." if result.host_bound else ".")
+        )
+    profile = ProfileReport(**result.profile) if result.profile else ProfileReport()
+    if not profile.is_empty():
+        lines.append("Profiler / compiler feedback (line numbers refer to the kernel below):\n" + profile.render())
     return "\n".join(lines)
 
 
 def _describe_attempts(attempts: list[tuple[Candidate, TrialResult]], best_result: TrialResult | None, round_index: int) -> str:
     def verdict(result: TrialResult) -> str:
         if result.status is TrialStatus.OK:
-            if best_result is not None and best_result.is_valid and result.latency_ms_median >= best_result.latency_ms_median:
-                return f"correct but not faster: {result.latency_ms_median:.4f} ms vs best {best_result.latency_ms_median:.4f} ms"
-            return f"correct, {result.latency_ms_median:.4f} ms (became the new best)"
+            grade = f", graded {result.numeric_grade}" if result.numeric_grade else ""
+            if best_result is not None and best_result.is_valid and result.objective_ms >= best_result.objective_ms:
+                return f"correct but not faster: {result.objective_ms:.4f} ms vs best {best_result.objective_ms:.4f} ms{grade}"
+            if result.is_reduced_precision:
+                return f"correct and fast ({result.objective_ms:.4f} ms) but graded reduced-precision{grade}"
+            return f"correct, {result.objective_ms:.4f} ms (became the new best){grade}"
         return f"{result.status.value}: {result.message[-1200:]}"
 
     # Show full source for one attempt only: the fastest correct one, else the first failure.
     correct = [pair for pair in attempts if pair[1].is_valid]
-    featured = min(correct, key=lambda pair: pair[1].latency_ms_median) if correct else attempts[0]
+    featured = min(correct, key=lambda pair: pair[1].objective_ms) if correct else attempts[0]
     lines = [f"# Previous round ({round_index - 1}) - {len(attempts)} attempt(s)"]
     for candidate, result in attempts:
         strategy = candidate.note or "(no strategy comment)"

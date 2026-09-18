@@ -1,7 +1,13 @@
-"""Roofline model: measure the machine's peak FMA throughput and streaming bandwidth once,
-then tell every trial how far it is from the attainable ceiling and which resource bounds it.
+"""Roofline model with a verdict.
 
-"1.7 ms" says nothing to an LLM; "compute-bound, 38% of attainable peak" does.
+Once per machine we measure peak FMA throughput, streaming bandwidth and the floor cost of
+dispatching a (parallel) kernel. Every trial is then placed against the attainable time
+
+    attainable_ms = max(flops / peak_compute, bytes / peak_bandwidth) + dispatch_overhead
+
+and classified as compute-, memory- or dispatch-overhead-bound. The verdict tells the agent
+two things a raw number cannot: whether the search has reached the ceiling (stop burning
+budget) and which family of optimizations can still pay off (steer the LLM and the search).
 """
 
 from __future__ import annotations
@@ -32,6 +38,27 @@ FMA_ITERS = 1_500_000
 WIDE_VECTOR_FLAGS = ("-mprefer-vector-width=512",)
 BANDWIDTH_FLOATS = 16 * 1024 * 1024  # 64 MiB in + 64 MiB out per pass
 BANDWIDTH_ITERS = 4
+DISPATCH_REPEATS = 200
+
+GUIDANCE = {
+    "compute": (
+        "Compute-bound: the FMA units are the limiter. Work on register tiling (a fixed MRxNR accumulator "
+        "tile in registers), more independent FMA chains (ILP), full-width vectors, packed operands so the "
+        "inner loop is unit-stride, and loop unrolling. Reducing memory traffic further will not help."
+    ),
+    "memory": (
+        "Memory-bound: bytes moved are the limiter. Fuse passes so each element is read from memory once, "
+        "vectorize loads/stores, use all threads to saturate bandwidth, consider streaming stores for "
+        "write-once outputs and cache blocking for reuse. More arithmetic cleverness will not help."
+    ),
+    "overhead": (
+        "Dispatch-overhead-bound: the operator is so small that launching the kernel / spawning the "
+        "parallel region costs more than the work. Do not micro-optimize the inner loop. Fuse this operator "
+        "with its neighbours, batch several calls into one launch, or skip the parallel region below a "
+        "size threshold."
+    ),
+}
+
 
 def peak_fma_source(vectors: int) -> str:
     return f"""#include <omp.h>
@@ -70,68 +97,150 @@ void peak_bandwidth_kernel(const float* X, float* Y, int N, int ITERS) {
 }
 """
 
+# The cheapest possible parallel kernel: what any OpenMP kernel pays before doing work.
+DISPATCH_SOURCE = """#include <omp.h>
+void dispatch_kernel(const float* X, float* Y, int N, int UNUSED) {
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) Y[i] = X[i];
+}
+"""
+
+# The cheapest possible serial kernel: the floor of one call through the harness.
+CALL_SOURCE = """
+void call_kernel(const float* X, float* Y, int N, int UNUSED) {
+    Y[0] = X[0];
+}
+"""
+
 
 @dataclass
 class MachinePeaks:
     compute_gflops: float
     bandwidth_gbps: float
-    source: str  # "measured" | "cached"
+    dispatch_overhead_ms: float  # floor of a parallel (OpenMP region) kernel launch
+    call_overhead_ms: float = 0.0  # floor of a serial kernel call
+    source: str = "measured"  # "measured" | "cached"
 
     def describe(self) -> str:
         return (
             f"peak FMA throughput ~{self.compute_gflops:.0f} GFLOP/s (all threads), "
-            f"streaming bandwidth ~{self.bandwidth_gbps:.1f} GB/s ({self.source})"
+            f"streaming bandwidth ~{self.bandwidth_gbps:.1f} GB/s, "
+            f"launch floors: serial call ~{self.call_overhead_ms * 1e3:.2f} us, parallel region ~{self.dispatch_overhead_ms * 1e3:.2f} us ({self.source})"
         )
 
 
 @dataclass
 class RooflineReport:
-    arithmetic_intensity: float  # FLOP per byte of the operator at the benchmark shape
+    arithmetic_intensity: float  # FLOP per byte of the operator at this shape
+    compute_time_ms: float
+    memory_time_ms: float
+    overhead_ms: float
+    attainable_ms: float
     attainable_gflops: float
-    bound: str  # "compute" | "memory"
-    fraction_of_attainable: float
+    bound: str  # "compute" | "memory" | "overhead"
+    fraction_of_attainable: float  # attainable_ms / measured_ms, capped at 1
     fraction_of_compute_peak: float
     fraction_of_bandwidth_peak: float
+    headroom_speedup: float  # measured_ms / attainable_ms: how much faster the ceiling still allows
+
+    @property
+    def guidance(self) -> str:
+        return GUIDANCE[self.bound]
 
     def describe(self) -> str:
         return (
-            f"{self.bound}-bound (intensity {self.arithmetic_intensity:.1f} FLOP/B); "
-            f"{self.fraction_of_attainable * 100:.0f}% of attainable {self.attainable_gflops:.0f} GFLOP/s; "
-            f"{self.fraction_of_compute_peak * 100:.0f}% of FMA peak, {self.fraction_of_bandwidth_peak * 100:.0f}% of bandwidth peak"
+            f"{self.bound}-bound (intensity {self.arithmetic_intensity:.1f} FLOP/B; ceiling {self.attainable_ms:.4f} ms = "
+            f"max(compute {self.compute_time_ms:.4f}, memory {self.memory_time_ms:.4f}) + call floor {self.overhead_ms:.4f}); "
+            f"{self.fraction_of_attainable * 100:.0f}% of attainable, headroom {self.headroom_speedup:.2f}x"
         )
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["guidance"] = self.guidance
+        return data
+
+
+@dataclass
+class Verdict:
+    """Decision derived from the roofline of the current best kernel."""
+
+    bound: str
+    attainable_ms: float
+    best_ms: float
+    fraction_of_attainable: float
+    at_ceiling: bool
+    ceiling_fraction: float
+    guidance: str
+
+    def describe(self) -> str:
+        state = (
+            f"AT CEILING: best is within {(1 - self.fraction_of_attainable) * 100:.0f}% of the attainable "
+            f"{self.attainable_ms:.4f} ms (threshold {self.ceiling_fraction * 100:.0f}%) - stop spending budget here"
+            if self.at_ceiling
+            else f"headroom {self.best_ms / max(self.attainable_ms, 1e-12):.2f}x to the attainable {self.attainable_ms:.4f} ms"
+        )
+        return f"{self.bound}-bound; {state}. {self.guidance}"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def analyze(peaks: MachinePeaks, flops: int, bytes_moved: int, attained_gflops: float, attained_gbps: float) -> RooflineReport:
-    intensity = flops / max(bytes_moved, 1)
-    memory_ceiling = intensity * peaks.bandwidth_gbps
-    attainable = min(peaks.compute_gflops, memory_ceiling)
+def analyze(peaks: MachinePeaks, flops: int, bytes_moved: int, measured_ms: float) -> RooflineReport:
+    compute_time_ms = flops / max(peaks.compute_gflops, 1e-9) / 1e6
+    memory_time_ms = bytes_moved / max(peaks.bandwidth_gbps, 1e-9) / 1e6
+    work_time_ms = max(compute_time_ms, memory_time_ms)
+    # The unavoidable floor is one serial call; the *parallel* dispatch floor decides whether
+    # spreading the work over threads can pay for itself at all.
+    overhead_ms = peaks.call_overhead_ms
+    attainable_ms = work_time_ms + overhead_ms
+    if peaks.dispatch_overhead_ms >= work_time_ms:
+        bound = "overhead"
+    elif compute_time_ms >= memory_time_ms:
+        bound = "compute"
+    else:
+        bound = "memory"
+    measured_seconds = max(measured_ms, 1e-12) / 1e3
     return RooflineReport(
-        arithmetic_intensity=intensity,
-        attainable_gflops=attainable,
-        bound="compute" if memory_ceiling >= peaks.compute_gflops else "memory",
-        fraction_of_attainable=attained_gflops / max(attainable, 1e-9),
-        fraction_of_compute_peak=attained_gflops / max(peaks.compute_gflops, 1e-9),
-        fraction_of_bandwidth_peak=attained_gbps / max(peaks.bandwidth_gbps, 1e-9),
+        arithmetic_intensity=flops / max(bytes_moved, 1),
+        compute_time_ms=compute_time_ms,
+        memory_time_ms=memory_time_ms,
+        overhead_ms=overhead_ms,
+        attainable_ms=attainable_ms,
+        attainable_gflops=flops / max(attainable_ms, 1e-12) / 1e6,
+        bound=bound,
+        fraction_of_attainable=min(1.0, attainable_ms / max(measured_ms, 1e-12)),
+        fraction_of_compute_peak=(flops / measured_seconds / 1e9) / max(peaks.compute_gflops, 1e-9),
+        fraction_of_bandwidth_peak=(bytes_moved / measured_seconds / 1e9) / max(peaks.bandwidth_gbps, 1e-9),
+        headroom_speedup=max(measured_ms, 1e-12) / max(attainable_ms, 1e-12),
+    )
+
+
+def verdict_for(report: RooflineReport, best_ms: float, ceiling_fraction: float) -> Verdict:
+    return Verdict(
+        bound=report.bound,
+        attainable_ms=report.attainable_ms,
+        best_ms=best_ms,
+        fraction_of_attainable=report.fraction_of_attainable,
+        at_ceiling=report.fraction_of_attainable >= ceiling_fraction,
+        ceiling_fraction=ceiling_fraction,
+        guidance=report.guidance,
     )
 
 
 def _cache_path(backend: Backend) -> Path:
     cache_root = Path(os.environ.get("KOPT_CACHE_DIR") or Path.home() / ".cache" / "kopt")
-    digest = hashlib.sha1(f"{backend.name}|{backend.hardware_summary()}".encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha1(f"{backend.name}|{backend.hardware_summary()}|v3".encode("utf-8")).hexdigest()[:12]
     return cache_root / f"peaks_{backend.name}_{digest}.json"
 
 
-def _probe_spec(name: str, symbol: str, source_text: str) -> OperatorSpec:
+def _probe_spec(name: str, symbol: str) -> OperatorSpec:
     return OperatorSpec(
         name=name,
         description="hardware probe",
         c_signature=f"void {symbol}(const float* X, float* Y, int A, int B)",
         symbol=symbol,
         primary_shape=(1,),
-        make_case=lambda shape: TestCase((TensorSpec("X", (1,)),), TensorSpec("Y", (1,)), (1, 1)),
+        make_case=lambda shape, dtype: TestCase((TensorSpec("X", (1,)),), TensorSpec("Y", (1,)), (1, 1)),
         reference=lambda inputs, scalars: inputs[0],
         flops=lambda shape: 0,
         bytes_moved=lambda shape: 0,
@@ -148,16 +257,17 @@ def _run_probe(
     scalars: tuple[int, int],
     repeats: int,
     flags: tuple[str, ...] = (),
+    statistic=statistics.median,
 ) -> float:
-    spec = _probe_spec(name, symbol, source_text)
+    spec = _probe_spec(name, symbol)
     compiled = backend.compile(Candidate(source=source_text, origin="probe", extra_compile_flags=flags), spec)
     if not compiled.ok or compiled.artifact is None:
         raise RuntimeError(f"{name} probe failed to compile: {compiled.log[:300]}")
     case = TestCase((TensorSpec("X", x.shape),), TensorSpec("Y", y_shape), scalars, label=name)
-    run = backend.run(compiled.artifact, spec, case, [x], warmup=1, repeats=repeats, timeout_seconds=120.0)
+    run = backend.run(compiled.artifact, spec, case, [x], warmup=2, repeats=repeats, timeout_seconds=120.0, verify=False)
     if not run.ok or not run.timings_ms:
         raise RuntimeError(f"{name} probe failed to run: {run.error}")
-    return statistics.median(run.timings_ms) / 1e3
+    return statistic(run.timings_ms) / 1e3
 
 
 def measure_peaks(backend: Backend, use_cache: bool = True) -> MachinePeaks:
@@ -165,7 +275,10 @@ def measure_peaks(backend: Backend, use_cache: bool = True) -> MachinePeaks:
     if use_cache and cache_path.exists():
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
-            return MachinePeaks(float(data["compute_gflops"]), float(data["bandwidth_gbps"]), "cached")
+            return MachinePeaks(
+                float(data["compute_gflops"]), float(data["bandwidth_gbps"]), float(data["dispatch_overhead_ms"]),
+                float(data["call_overhead_ms"]), "cached",
+            )
         except (OSError, KeyError, ValueError, TypeError):
             pass
 
@@ -189,10 +302,29 @@ def measure_peaks(backend: Backend, use_cache: bool = True) -> MachinePeaks:
     )
     bandwidth_gbps = BANDWIDTH_ITERS * BANDWIDTH_FLOATS * 8 / bandwidth_seconds / 1e9
 
-    peaks = MachinePeaks(compute_gflops, bandwidth_gbps, "measured")
+    # Dispatch floor: the fastest observed call of a trivial parallel kernel on 64 elements.
+    dispatch_seconds = _run_probe(
+        backend, "dispatch", "dispatch_kernel", DISPATCH_SOURCE, np.ones(64, dtype=np.float32), (64,), (64, 0),
+        repeats=DISPATCH_REPEATS, statistic=min,
+    )
+
+    call_seconds = _run_probe(
+        backend, "call", "call_kernel", CALL_SOURCE, np.ones(64, dtype=np.float32), (64,), (64, 0),
+        repeats=DISPATCH_REPEATS, statistic=min,
+    )
+
+    peaks = MachinePeaks(compute_gflops, bandwidth_gbps, dispatch_seconds * 1e3, call_seconds * 1e3, "measured")
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({"compute_gflops": compute_gflops, "bandwidth_gbps": bandwidth_gbps}), encoding="utf-8")
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "compute_gflops": compute_gflops, "bandwidth_gbps": bandwidth_gbps,
+                    "dispatch_overhead_ms": peaks.dispatch_overhead_ms, "call_overhead_ms": peaks.call_overhead_ms,
+                }
+            ),
+            encoding="utf-8",
+        )
     except OSError as error:
         logger.debug("could not cache peaks: %s", error)
     return peaks

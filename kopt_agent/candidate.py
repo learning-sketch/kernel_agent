@@ -13,6 +13,12 @@ class Candidate:
     params: dict = field(default_factory=dict)
     extra_compile_flags: tuple[str, ...] = ()
     note: str = ""
+    # Declared activation predicate of an optional fast path, over the kernel's int scalars
+    # (e.g. "M % 8 == 0 and N % 16 == 0"). A kernel that declares one must export
+    # `int kopt_fast_path_active` and set it to 1 exactly when the fast path ran. The
+    # evaluator asserts activation on matching inputs and correctness of the fallback on
+    # the others, so "fast" cannot mean "only works on the benchmark shape".
+    fast_path_predicate: str | None = None
 
     @property
     def fingerprint(self) -> str:

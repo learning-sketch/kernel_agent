@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kernel-opt-agent"
-version = "0.1.0"
+version = "0.3.0"
 description = "An agent loop that implements operators as kernels on a target chip and searches for the fastest correct version."
 readme = "README.md"
 requires-python = ">=3.10"

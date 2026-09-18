@@ -3,13 +3,21 @@
 Phases (all through the same evaluator, so "faster" always means "faster AND correct on
 every test case"):
 
-1. baseline      - the naive kernel: correctness anchor and speedup denominator.
+1. baseline      - the naive kernel: correctness anchor, speedup denominator and the A/B
+                   reference that is interleaved with every benchmark-grade timing.
 2. autotune      - template schedules: warm start from the knowledge base, random sampling,
                    then evolutionary refinement of the top configurations. Candidates are
                    evaluated in tiered batches (parallel compile/verify, quick timing, full
-                   timing only for the top-k).
-3. llm refine    - best-of-N kernels per round from an LLM that sees roofline position,
-                   compiler vectorizer notes and the outcome of every previous attempt.
+                   timing only for the top-k). Directions recorded as dead ends are pruned.
+3. llm refine    - best-of-N kernels per round from an LLM that sees the roofline verdict,
+                   structured profiler feedback, known dead ends and the outcome of every
+                   previous attempt.
+
+After each phase the roofline verdict of the current best is checked: once it is within the
+configured fraction of the attainable time the remaining phases are skipped ("at the
+ceiling"). The objective is the workload-weighted total time when a workload profile is
+given, otherwise the primary-shape latency. For fused operators the run ends with a fusion
+gain report (fused kernel vs. the stages executed separately).
 """
 
 from __future__ import annotations
@@ -27,8 +35,8 @@ from kopt_agent.evaluator import Evaluator, TrialResult
 from kopt_agent.generators.llm import LLMGenerator, LLMUnavailable, RoundFeedback
 from kopt_agent.generators.template import TemplateGenerator
 from kopt_agent.history import History
-from kopt_agent.knowledge import KnowledgeBase
-from kopt_agent.roofline import MachinePeaks, measure_peaks
+from kopt_agent.knowledge import KnowledgeBase, direction_keys
+from kopt_agent.roofline import MachinePeaks, Verdict, analyze, measure_peaks, verdict_for
 from kopt_agent.spec import OperatorSpec
 
 logger = logging.getLogger("kopt")
@@ -47,6 +55,10 @@ class AgentConfig:
     warm_start: int = 3  # configurations seeded from the knowledge base
     template_name: str | None = None  # which of the operator's templates to tune (default: bundle default)
     roofline: bool = True
+    ceiling_fraction: float = 0.85  # declare "at the ceiling" when best >= this fraction of attainable
+    stop_at_ceiling: bool = True
+    allow_reduced_precision: bool = False  # let reduced-precision candidates win precision-sensitive ops
+    fusion_report: bool = True
     seed: int = 0
     warmup: int = 3
     repeats: int = 15
@@ -61,6 +73,9 @@ class OperatorBundle:
     baseline_source: str
     templates: dict[str, TemplateGenerator] = field(default_factory=dict)
     default_template: str | None = None
+    # For fused operators: bundles of the individual stages at the same shapes, used to
+    # measure "fused vs. run separately".
+    fusion_parts: list["OperatorBundle"] = field(default_factory=list)
 
     def select_template(self, name: str | None) -> TemplateGenerator | None:
         if not self.templates:
@@ -92,9 +107,27 @@ class OptimizationAgent:
                 self.peaks = measure_peaks(backend)
             except RuntimeError as error:
                 logger.warning("roofline: peak probes failed, continuing without roofline (%s)", error)
-        self.evaluator = Evaluator(
-            self.spec,
-            backend,
+        self.evaluator = self._make_evaluator(self.spec)
+        operator_dir = Path(config.output_dir) / self.spec.name
+        compile_command = getattr(backend, "portable_compile_command", lambda: None)()
+        self.history = History(
+            operator_dir, spec=self.spec, allow_reduced_precision=config.allow_reduced_precision, compile_command=compile_command
+        )
+        # Knowledge is per template: tile parameters of one schedule mean nothing to another.
+        template_tag = config.template_name or bundle.default_template or "template"
+        self.knowledge = KnowledgeBase(operator_dir / f"knowledge_{template_tag}.jsonl")
+        self.rng = random.Random(config.seed)
+        self._seen_signatures: set[tuple] = set()
+        self._parents: dict[str, TrialResult] = {}  # child fingerprint -> parent result (for negative knowledge)
+        self.verdict: Verdict | None = None
+        self.stopped_at_ceiling = False
+        self.fusion_gain: dict | None = None
+
+    def _make_evaluator(self, spec: OperatorSpec) -> Evaluator:
+        config = self.config
+        return Evaluator(
+            spec,
+            self.backend,
             warmup=config.warmup,
             repeats=config.repeats,
             run_timeout_seconds=config.run_timeout_seconds,
@@ -103,34 +136,52 @@ class OptimizationAgent:
             workers=config.workers,
             quick_repeats=config.quick_repeats,
         )
-        operator_dir = Path(config.output_dir) / self.spec.name
-        self.history = History(operator_dir)
-        # Knowledge is per template: tile parameters of one schedule mean nothing to another.
-        template_tag = config.template_name or bundle.default_template or "template"
-        self.knowledge = KnowledgeBase(operator_dir / f"knowledge_{template_tag}.jsonl")
-        self.rng = random.Random(config.seed)
-        self._seen_signatures: set[tuple] = set()
 
     def run(self) -> History:
         started = time.perf_counter()
-        logger.info("operator=%s shape=%s backend=%s", self.spec.name, self.spec.primary_shape, self.backend.name)
+        logger.info(
+            "operator=%s dtype=%s shape=%s backend=%s%s", self.spec.name, self.spec.dtype.name, self.spec.primary_shape, self.backend.name,
+            " precision-sensitive" + ("" if self.config.allow_reduced_precision else " (reduced-precision candidates cannot win)") if self.spec.precision_sensitive else "",
+        )
         logger.info("hardware: %s", self.hardware)
         if self.peaks is not None:
             logger.info("roofline: %s", self.peaks.describe())
+        if self.spec.workload is not None:
+            logger.info(
+                "workload: %d calls over %d shapes - objective is the call-weighted total time: %s",
+                self.spec.workload.total_calls, len(self.spec.workload.entries),
+                ", ".join(f"{'x'.join(map(str, e.shape))} x{e.count}" for e in self.spec.workload.entries),
+            )
         logger.info("correctness cases: %s", ", ".join(case.label for case in self.evaluator.cases))
 
         self._phase_baseline()
-        self._phase_autotune()
-        self._phase_llm_refine()
+        if not self._at_ceiling("baseline"):
+            self._phase_autotune()
+        if not self._at_ceiling("autotune"):
+            self._phase_llm_refine()
+        self._at_ceiling("final")
+        self._phase_fusion_report()
 
         elapsed = time.perf_counter() - started
         self.history.write_summary(
             {
                 "operator": self.spec.name,
+                "dtype": self.spec.dtype.name,
                 "shape": list(self.spec.primary_shape),
+                "workload": [{"shape": list(e.shape), "count": e.count} for e in self.spec.workload.entries] if self.spec.workload else None,
                 "backend": self.backend.name,
                 "hardware": self.hardware,
-                "peaks": {"compute_gflops": self.peaks.compute_gflops, "bandwidth_gbps": self.peaks.bandwidth_gbps} if self.peaks else None,
+                "peaks": (
+                    {
+                        "compute_gflops": self.peaks.compute_gflops, "bandwidth_gbps": self.peaks.bandwidth_gbps,
+                        "dispatch_overhead_ms": self.peaks.dispatch_overhead_ms, "call_overhead_ms": self.peaks.call_overhead_ms,
+                    }
+                    if self.peaks else None
+                ),
+                "verdict": self.verdict.to_dict() if self.verdict else None,
+                "stopped_at_ceiling": self.stopped_at_ceiling,
+                "fusion_gain": self.fusion_gain,
+                "dead_ends": self.knowledge.dead_end_summary(self.spec.primary_shape, self.hardware, limit=50),
                 "wall_seconds": elapsed,
                 "llm_calls": self.llm.calls if self.llm else 0,
             }
@@ -142,12 +193,17 @@ class OptimizationAgent:
 
     def _phase_baseline(self) -> None:
         candidate = Candidate(source=self.bundle.baseline_source, origin="baseline", note="naive reference kernel")
-        result = self._record(candidate, self.evaluator.evaluate(candidate), phase="baseline")
+        result = self.evaluator.evaluate(candidate)
+        self.evaluator.calibrate_precision(result)
+        result = self._record(candidate, result, phase="baseline")
         if not result.is_valid:
             raise RuntimeError(
                 f"baseline kernel for '{self.spec.name}' failed ({result.status.value}: {result.message}). "
                 "The baseline must be correct: it anchors speedups and seeds the LLM."
             )
+        compiled = self.backend.compile(candidate, self.spec)  # cached: gives us the artifact for A/B timing
+        if compiled.ok and compiled.artifact is not None:
+            self.evaluator.reference_artifact = compiled.artifact
 
     def _phase_autotune(self) -> None:
         template = self.template
@@ -178,10 +234,13 @@ class OptimizationAgent:
             len(initial), len(warm_params), len(initial) - 1 - len(warm_params), template.space_size(),
         )
         self._evaluate_batch(initial, phase="autotune")
+        if self._at_ceiling("autotune stage 1"):
+            return
 
-        # Stage 2: evolve the best configurations found so far.
+        # Stage 2: evolve the best configurations found so far, skipping known dead-end directions.
         remaining = evolve_budget
         generation = 0
+        pruned_total = 0
         while remaining > 0:
             generation += 1
             parents = self.history.valid_results(origins=("template-default", "warm-start", "autotune", "evolve"))[: self.config.evolve_parents]
@@ -191,23 +250,32 @@ class OptimizationAgent:
             children: list[Candidate] = []
             batch_size = min(remaining, max(self.config.workers * 2, 2))
             attempts_without_child = 0
-            while len(children) < batch_size and attempts_without_child < 8:
+            while len(children) < batch_size and attempts_without_child < 12:
                 parent = self.rng.choice(parents)
                 child_params = template.mutate(parent.params, self.rng, self._seen_signatures)
                 if child_params is None:
+                    attempts_without_child += 1
+                    continue
+                keys = direction_keys({**template.default_params, **parent.params}, {**template.default_params, **child_params})
+                if self.knowledge.is_pruned(self.hardware, keys):
+                    self._seen_signatures.add(template.signature(child_params))
+                    pruned_total += 1
                     attempts_without_child += 1
                     continue
                 candidate = self._template_candidate(template, child_params, "evolve")
                 if candidate is None:
                     attempts_without_child += 1
                     continue
+                self._parents[candidate.fingerprint] = parent
                 children.append(candidate)
             if not children:
                 logger.info("evolve: neighbourhood of the top configurations is exhausted, stopping")
                 break
-            logger.info("evolve: generation %d, %d children of %d parents", generation, len(children), len(parents))
+            logger.info("evolve: generation %d, %d children of %d parents%s", generation, len(children), len(parents), f" ({pruned_total} dead-end moves pruned so far)" if pruned_total else "")
             self._evaluate_batch(children, phase=f"evolve g{generation}")
             remaining -= len(children)
+            if self._at_ceiling(f"evolve g{generation}"):
+                return
 
     def _phase_llm_refine(self) -> None:
         if self.config.llm_rounds <= 0:
@@ -221,6 +289,7 @@ class OptimizationAgent:
         for round_index in range(1, self.config.llm_rounds + 1):
             best_candidate, best_result = self.history.best if self.history.best else (None, None)
             best_source = best_candidate.source if best_candidate else self.bundle.baseline_source
+            dead_ends = self.knowledge.dead_end_summary(self.spec.primary_shape, self.hardware)
             try:
                 candidates, problems = self.llm.propose_many(
                     self.config.llm_samples,
@@ -232,6 +301,8 @@ class OptimizationAgent:
                     feedback=feedback,
                     round_index=round_index,
                     peaks_summary=self.peaks.describe() if self.peaks else "",
+                    verdict=self.verdict,
+                    dead_ends=dead_ends,
                 )
             except LLMUnavailable as error:
                 logger.warning("llm: stopping, %s", error)
@@ -265,14 +336,102 @@ class OptimizationAgent:
                     break
                 continue
 
-            best_before = self.history.best[1].latency_ms_median if self.history.best else math.inf
+            best_before = self.history.best[1].objective_ms if self.history.best else math.inf
+            if best_result is not None:
+                for candidate in fresh:
+                    self._parents[candidate.fingerprint] = best_result
             results = self._evaluate_batch(fresh, phase=f"llm r{round_index}", top_k=max(self.config.top_k, 1))
             feedback = RoundFeedback(attempts=list(zip(fresh, results)), extra=extra)
-            improved = self.history.best is not None and self.history.best[1].latency_ms_median < best_before
+            improved = self.history.best is not None and self.history.best[1].objective_ms < best_before
             rounds_without_gain = 0 if improved else rounds_without_gain + 1
+            if self._at_ceiling(f"llm r{round_index}"):
+                return
             if rounds_without_gain >= self.config.llm_patience:
                 logger.info("llm: no improvement for %d rounds, stopping early", rounds_without_gain)
                 break
+
+    def _phase_fusion_report(self) -> None:
+        """Fused best vs. the stages run separately (best of baseline / template default per stage)."""
+        if not self.bundle.fusion_parts or not self.config.fusion_report or self.history.best is None:
+            return
+        stage_times: list[dict] = []
+        for part in self.bundle.fusion_parts:
+            evaluator = self._make_evaluator(part.spec)
+            candidates = [Candidate(source=part.baseline_source, origin="baseline", note="stage baseline")]
+            template = part.select_template(None)
+            if template is not None:
+                candidates.append(template.default_candidate())
+            best_ms = math.inf
+            best_label = "none"
+            for candidate in candidates:
+                result = evaluator.evaluate(candidate)
+                if result.is_valid and result.objective_ms < best_ms:
+                    best_ms, best_label = result.objective_ms, f"{candidate.origin}"
+            if not math.isfinite(best_ms):
+                logger.warning("fusion report: no correct kernel for stage %s, skipping report", part.spec.name)
+                return
+            stage_times.append({"stage": part.spec.name, "shape": list(part.spec.primary_shape), "best_ms": best_ms, "kernel": best_label})
+        separate_ms = sum(stage["best_ms"] for stage in stage_times)
+        fused_ms = self.history.best[1].objective_ms
+        self.fusion_gain = {
+            "stages": stage_times,
+            "separate_total_ms": separate_ms,
+            "fused_best_ms": fused_ms,
+            "fusion_speedup": separate_ms / fused_ms if fused_ms > 0 else None,
+        }
+        logger.info(
+            "fusion: %s separately = %.4f ms (%s); fused best = %.4f ms -> fusion speedup %.2fx",
+            " + ".join(stage["stage"] for stage in stage_times), separate_ms,
+            ", ".join(f"{stage['stage']} {stage['best_ms']:.4f} ms [{stage['kernel']}]" for stage in stage_times),
+            fused_ms, separate_ms / fused_ms if fused_ms > 0 else float("nan"),
+        )
+
+    # ---- roofline verdict -------------------------------------------------------------
+
+    def _compute_verdict(self) -> Verdict | None:
+        if self.peaks is None or self.history.best is None:
+            return None
+        best = self.history.best[1]
+        if self.spec.workload is None or not best.per_shape:
+            report = analyze(self.peaks, self.spec.flops(self.spec.primary_shape), self.spec.bytes_moved(self.spec.primary_shape), best.latency_ms_median)
+            return verdict_for(report, best.latency_ms_median, self.config.ceiling_fraction)
+        # Workload: the ceiling is the call-weighted sum of per-shape ceilings; the bound is that
+        # of the shape that dominates the weighted time.
+        weighted_attainable = 0.0
+        dominant_entry = None
+        dominant_time = -1.0
+        for entry in best.per_shape.values():
+            if entry["weight"] <= 0:
+                continue
+            report = analyze(self.peaks, self.spec.flops(tuple(entry["shape"])), self.spec.bytes_moved(tuple(entry["shape"])), entry["latency_ms"])
+            weighted_attainable += entry["weight"] * report.attainable_ms
+            if entry["weight"] * entry["latency_ms"] > dominant_time:
+                dominant_time = entry["weight"] * entry["latency_ms"]
+                dominant_entry = report
+        if dominant_entry is None:
+            return None
+        fraction = min(1.0, weighted_attainable / max(best.objective_ms, 1e-12))
+        return Verdict(
+            bound=dominant_entry.bound,
+            attainable_ms=weighted_attainable,
+            best_ms=best.objective_ms,
+            fraction_of_attainable=fraction,
+            at_ceiling=fraction >= self.config.ceiling_fraction,
+            ceiling_fraction=self.config.ceiling_fraction,
+            guidance=dominant_entry.guidance,
+        )
+
+    def _at_ceiling(self, phase: str) -> bool:
+        self.verdict = self._compute_verdict()
+        if self.verdict is None:
+            return False
+        logger.info("verdict after %s: %s", phase, self.verdict.describe())
+        if self.verdict.at_ceiling and self.config.stop_at_ceiling:
+            if not self.stopped_at_ceiling:
+                logger.info("at the ceiling: stopping the search, remaining phases skipped (use --no-stop-at-ceiling to continue)")
+            self.stopped_at_ceiling = True
+            return True
+        return False
 
     # ---- helpers ----------------------------------------------------------------------
 
@@ -295,15 +454,28 @@ class OptimizationAgent:
     def _record(self, candidate: Candidate, result: TrialResult, phase: str) -> TrialResult:
         became_best = self.history.record(candidate, result)
         self.knowledge.append(self.spec.primary_shape, self.hardware, result)
+        parent = self._parents.pop(candidate.fingerprint, None)
+        if result.origin != "baseline":
+            direction = (candidate.note or None) if result.origin == "llm" else None
+            dead_end = self.knowledge.record_outcome(self.spec.primary_shape, self.hardware, result, parent=parent, direction=direction)
+            if dead_end is not None:
+                logger.info("[%s] trial %d dead end: %s -> %s", phase, result.trial_id, dead_end.direction, dead_end.cause)
         if result.is_valid:
             marker = "  <-- new best" if became_best else ""
+            if result.is_reduced_precision and self.history.precision_gated and result.is_benchmark_grade:
+                marker = "  (reduced-precision: excluded from best; --allow-reduced-precision to accept)"
             tier = "" if result.timing_tier == "full" else " (quick)"
             roof = f", {result.roofline['fraction_of_attainable'] * 100:.0f}% of roofline" if result.roofline else ""
+            ab = f", A/B {result.ab_speedup:.2f}x" if result.ab_speedup else ""
+            objective = f", weighted {result.objective_ms:.4f} ms" if self.spec.workload is not None else ""
             logger.info(
-                "[%s] trial %d %s: %.4f ms%s, %.1f GFLOP/s, %.1f GB/s%s%s",
-                phase, result.trial_id, candidate.short_label(), result.latency_ms_median, tier, result.gflops, result.gbps, roof, marker,
+                "[%s] trial %d %s: %.4f ms%s%s, %.1f GFLOP/s, %.1f GB/s, %s%s%s%s",
+                phase, result.trial_id, candidate.short_label(), result.latency_ms_median, tier, objective, result.gflops, result.gbps,
+                result.numeric_grade, roof, ab, marker,
             )
+            for note in result.notes:
+                logger.info("[%s] trial %d note: %s", phase, result.trial_id, note)
         else:
             first_line = result.message.strip().splitlines()[0] if result.message.strip() else ""
-            logger.info("[%s] trial %d %s: %s - %s", phase, result.trial_id, candidate.short_label(), result.status.value, first_line[:160])
+            logger.info("[%s] trial %d %s: %s - %s", phase, result.trial_id, candidate.short_label(), result.status.value, first_line[:200])
         return result
