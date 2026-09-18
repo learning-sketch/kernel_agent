@@ -199,5 +199,5 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
-`requires-python = ">=3.10"`;`.github/workflows/ci.yml` 在 3.10 / 3.11 / 3.12 上各跑一遍 `compileall` + `pytest`,3.10 是必须保持绿色的最低版本。
+`requires-python = ">=3.10"`,提交前请至少在 3.10 上跑一遍 `python -m compileall kopt_agent ops tests && pytest -q`。
 需要 gcc + OpenMP;fp16 / bf16 相关用例在编译器不支持 `_Float16` / `__bf16`(x86 上分别需要 gcc ≥ 12 / ≥ 13)时自动跳过,`kopt run --dtype fp16|bf16` 在这种机器上会给出明确报错而不是编译失败。
