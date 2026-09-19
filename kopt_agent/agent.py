@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kopt_agent.backends.base import Backend
+from kopt_agent.bundle import BundleContext, export_bundle
 from kopt_agent.candidate import Candidate
 from kopt_agent.evaluator import Evaluator, TrialResult
 from kopt_agent.generators.llm import LLMGenerator, LLMUnavailable, RoundFeedback
@@ -129,6 +130,7 @@ class OptimizationAgent:
         self.verdict: Verdict | None = None
         self.stopped_at_ceiling = False
         self.fusion_gain: dict | None = None
+        self.bundle_dir: Path | None = None
 
     def _make_evaluator(self, spec: OperatorSpec) -> Evaluator:
         config = self.config
@@ -171,21 +173,26 @@ class OptimizationAgent:
         self._phase_fusion_report()
 
         elapsed = time.perf_counter() - started
+        peaks = (
+            {
+                "compute_gflops": self.peaks.compute_gflops, "bandwidth_gbps": self.peaks.bandwidth_gbps,
+                "dispatch_overhead_ms": self.peaks.dispatch_overhead_ms, "call_overhead_ms": self.peaks.call_overhead_ms,
+            }
+            if self.peaks else None
+        )
         self.history.write_summary(
             {
                 "operator": self.spec.name,
                 "dtype": self.spec.dtype.name,
+                "output_dtype": self.spec.output_dtype.name if self.spec.output_dtype is not None else None,
+                "accumulate_dtype": self.spec.accumulate_dtype.name if self.spec.accumulate_dtype is not None else None,
+                "precision": self.spec.precision_label(),
                 "shape": list(self.spec.primary_shape),
                 "workload": [{"shape": list(e.shape), "count": e.count} for e in self.spec.workload.entries] if self.spec.workload else None,
                 "backend": self.backend.name,
+                "launch_abi": self.backend.launch_abi.to_dict(),
                 "hardware": self.hardware,
-                "peaks": (
-                    {
-                        "compute_gflops": self.peaks.compute_gflops, "bandwidth_gbps": self.peaks.bandwidth_gbps,
-                        "dispatch_overhead_ms": self.peaks.dispatch_overhead_ms, "call_overhead_ms": self.peaks.call_overhead_ms,
-                    }
-                    if self.peaks else None
-                ),
+                "peaks": peaks,
                 "verdict": self.verdict.to_dict() if self.verdict else None,
                 "stopped_at_ceiling": self.stopped_at_ceiling,
                 "fusion_gain": self.fusion_gain,
@@ -194,6 +201,19 @@ class OptimizationAgent:
                 "llm_calls": self.llm.calls if self.llm else 0,
             }
         )
+        if self.history.best is not None:
+            best_candidate, best_result = self.history.best
+            context = BundleContext(
+                backend_name=self.backend.name,
+                launch_abi=self.backend.launch_abi.to_dict(),
+                hardware=self.hardware,
+                baseline=self.history.baseline,
+                verdict=self.verdict.to_dict() if self.verdict else None,
+                peaks=peaks,
+                extra={"fusion_gain": self.fusion_gain} if self.fusion_gain else {},
+            )
+            self.bundle_dir = export_bundle(self.history, best_candidate, best_result, context)
+            logger.info("integration bundle: %s", self.bundle_dir)
         logger.info("finished in %.1fs, %d trials, statuses=%s", elapsed, len(self.history.records), self.history.status_counts())
         return self.history
 

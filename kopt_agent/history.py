@@ -11,6 +11,18 @@ from kopt_agent.evaluator import TrialResult, TrialStatus
 from kopt_agent.spec import OperatorSpec
 
 
+def candidate_record(candidate: Candidate) -> dict:
+    """JSON view of a candidate minus its source (which is stored as a .c file)."""
+    return {
+        "origin": candidate.origin,
+        "params": dict(candidate.params),
+        "extra_compile_flags": list(candidate.extra_compile_flags),
+        "fast_path_predicate": candidate.fast_path_predicate,
+        "note": candidate.note,
+        "fingerprint": candidate.fingerprint,
+    }
+
+
 class History:
     def __init__(
         self,
@@ -150,6 +162,7 @@ class History:
         summary = {
             "best": self.best[1].to_dict() if self.best else None,
             "best_note": self.best[0].note if self.best else None,
+            "best_candidate": candidate_record(self.best[0]) if self.best else None,
             "best_reduced_precision": self.best_reduced[1].to_dict() if self.best_reduced else None,
             "trials": len(self.records),
             "status_counts": self.status_counts(),
@@ -164,41 +177,62 @@ class History:
     def _write_parity_test(self, candidate: Candidate, result: TrialResult) -> None:
         if self.spec is None:
             return
-        spec = self.spec
-        shapes = [list(spec.primary_shape)] + [list(shape) for shape, _ in spec.timing_shapes()] + [list(shape) for shape in spec.edge_shapes]
-        unique_shapes = []
-        for shape in shapes:
-            if shape not in unique_shapes:
-                unique_shapes.append(shape)
+        self.write_parity_test(candidate, result, self.output_dir / "parity_test.py", kernel_filename="best.c")
+
+    def parity_compile_command(self, candidate: Candidate) -> list[str]:
+        """The portable compile command with the candidate's own extra flags spliced in."""
         compile_command = self.compile_command or ["gcc", "-O3", "-march=native", "-fopenmp", "-shared", "-fPIC", "{source}", "-lm", "-o", "{artifact}"]
         command_with_flags = []
         for token in compile_command:
             command_with_flags.append(token)
             if token == "-fPIC":
                 command_with_flags.extend(candidate.extra_compile_flags)
+        if candidate.extra_compile_flags and "-fPIC" not in compile_command:
+            index = command_with_flags.index("{source}") if "{source}" in command_with_flags else len(command_with_flags)
+            command_with_flags[index:index] = list(candidate.extra_compile_flags)
+        return command_with_flags
+
+    def write_parity_test(self, candidate: Candidate, result: TrialResult, path: Path, kernel_filename: str) -> Path:
+        """Emit the standalone parity test next to `kernel_filename` (the kernel source in the
+        same directory as the test)."""
+        spec = self.spec
+        if spec is None:
+            raise ValueError("a spec is required to write a parity test")
+        shapes = [list(spec.primary_shape)] + [list(shape) for shape, _ in spec.timing_shapes()] + [list(shape) for shape in spec.edge_shapes]
+        unique_shapes = []
+        for shape in shapes:
+            if shape not in unique_shapes:
+                unique_shapes.append(shape)
         script = PARITY_TEMPLATE.format(
             operator=spec.name,
             dtype=spec.dtype.name,
+            output_dtype=repr(spec.out_dtype.name if spec.output_dtype is not None else None),
+            accumulate_dtype=repr(spec.acc_dtype.name if spec.accumulate_dtype is not None else None),
+            precision=spec.precision_label(),
             symbol=spec.symbol,
+            kernel_file=kernel_filename,
             scalar_names=json.dumps(list(spec.scalar_names)),
             shapes=json.dumps(unique_shapes),
-            compile_command=json.dumps(command_with_flags),
+            compile_command=json.dumps(self.parity_compile_command(candidate)),
             atol=repr(spec.policy.atol),
             rtol=repr(spec.policy.rtol),
             fast_path=repr(candidate.fast_path_predicate),
             trial_id=result.trial_id,
             grade=result.numeric_grade,
         )
-        (self.output_dir / "parity_test.py").write_text(script, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(script, encoding="utf-8")
+        return path
 
 
-PARITY_TEMPLATE = '''"""Parity / regression test for the winning kernel of operator `{operator}` ({dtype}), trial {trial_id}.
+PARITY_TEMPLATE = '''"""Parity / regression test for the winning kernel of operator `{operator}` ({precision}), trial {trial_id}.
 
-Standalone apart from numpy, a C compiler and this repository's `ops`/`kopt_agent.dtypes` for the
-reference implementation. Run with `pytest parity_test.py` (or `python parity_test.py`) after
-integrating best.c somewhere else to make sure it still matches the reference on the benchmark,
-workload and edge shapes, on special values (NaN / Inf / signed zero / denormals), and that it
-neither modifies its const inputs nor depends on the prior contents of the output buffer.
+Standalone apart from numpy, a C compiler and the `ops` / `kopt_agent` packages of the
+kernel-opt-agent repository for the reference implementation (either `pip install` that repo or
+point KOPT_REPO at a checkout). Run with `pytest parity_test.py` (or `python parity_test.py`)
+after integrating {kernel_file} somewhere else to make sure it still matches the reference on the
+benchmark, workload and edge shapes, on special values (NaN / Inf / signed zero / denormals), and
+that it neither modifies its const inputs nor depends on the prior contents of the output buffer.
 Numeric grade at the time of writing: {grade}.
 """
 import ctypes
@@ -213,25 +247,42 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent.parent  # results/<op>/parity_test.py -> repo root
-sys.path.insert(0, str(REPO))
 
-from ops import build_operator  # noqa: E402
+
+def _locate_repo():
+    override = os.environ.get("KOPT_REPO")
+    if override:
+        return Path(override)
+    for ancestor in [HERE, *HERE.parents]:
+        if (ancestor / "ops" / "__init__.py").exists() and (ancestor / "kopt_agent").is_dir():
+            return ancestor
+    return None
+
+
+REPO = _locate_repo()
+if REPO is not None:
+    sys.path.insert(0, str(REPO))
+
+from ops import build_operator  # noqa: E402  (falls back to the installed package)
 
 OPERATOR = "{operator}"
 DTYPE = "{dtype}"
+OUTPUT_DTYPE = {output_dtype}
+ACCUMULATE_DTYPE = {accumulate_dtype}
 SYMBOL = "{symbol}"
+KERNEL_FILE = "{kernel_file}"
 SCALAR_NAMES = {scalar_names}
 SHAPES = {shapes}
 COMPILE_COMMAND = {compile_command}
 ATOL, RTOL = {atol}, {rtol}
 FAST_PATH_PREDICATE = {fast_path}
 POISON = 0x5C
+ALIGNMENT = 64
 
 
 def _compile():
     artifact = Path(tempfile.mkdtemp()) / "kernel.so"
-    command = [token.format(source=str(HERE / "best.c"), artifact=str(artifact)) for token in COMPILE_COMMAND]
+    command = [token.format(source=str(HERE / KERNEL_FILE), artifact=str(artifact)) for token in COMPILE_COMMAND]
     subprocess.run(command, check=True)
     return ctypes.CDLL(str(artifact))
 
@@ -241,26 +292,42 @@ FUNCTION = getattr(LIBRARY, SYMBOL)
 FUNCTION.restype = None
 
 
+def _aligned_like(shape, dtype, alignment=ALIGNMENT):
+    """The kernel contract promises 64-byte aligned, contiguous tensors (aligned vector loads
+    may be used), so every buffer handed to it is allocated that way."""
+    dtype = np.dtype(dtype)
+    nbytes = int(np.prod(shape)) * dtype.itemsize if len(shape) else dtype.itemsize
+    raw = np.empty(nbytes + alignment, dtype=np.uint8)
+    offset = (-raw.ctypes.data) % alignment
+    return raw[offset : offset + nbytes].view(dtype).reshape(shape)
+
+
+def _aligned_copy(array):
+    aligned = _aligned_like(array.shape, array.dtype)
+    aligned[...] = array
+    return aligned
+
+
 def _run(bundle, shape, inputs_storage, prefill):
     spec = bundle.spec
     case = spec.make_case(tuple(shape), spec.dtype)
-    output = np.empty(case.output.shape, dtype=case.output.dtype.storage)
+    output = _aligned_like(case.output.shape, case.output.dtype.storage)
     output.view(np.uint8).fill(prefill)
-    pointers = [np.ascontiguousarray(a).ctypes.data_as(ctypes.c_void_p) for a in inputs_storage] + [output.ctypes.data_as(ctypes.c_void_p)]
+    pointers = [a.ctypes.data_as(ctypes.c_void_p) for a in inputs_storage] + [output.ctypes.data_as(ctypes.c_void_p)]
     FUNCTION.argtypes = [ctypes.c_void_p] * len(pointers) + [ctypes.c_int] * len(case.scalars)
     FUNCTION(*pointers, *[ctypes.c_int(s) for s in case.scalars])
     return case, output
 
 
 def _check(shape, make_values, strict_special=True):
-    bundle = build_operator(OPERATOR, tuple(shape), dtype=DTYPE)
+    bundle = build_operator(OPERATOR, tuple(shape), dtype=DTYPE, output_dtype=OUTPUT_DTYPE, accumulate_dtype=ACCUMULATE_DTYPE)
     spec = bundle.spec
     case = spec.make_case(tuple(shape), spec.dtype)
     rng = np.random.default_rng(1234)
     inputs_storage = []
     for tensor in case.inputs:
         values = make_values(tensor, rng)
-        inputs_storage.append(tensor.dtype.encode(np.asarray(values, dtype=np.float64)))
+        inputs_storage.append(_aligned_copy(tensor.dtype.encode(np.asarray(values, dtype=np.float64))))
     snapshots = [a.copy() for a in inputs_storage]
     decoded = [t.dtype.decode(a) for t, a in zip(case.inputs, inputs_storage)]
     expected = case.output.dtype.decode(case.output.dtype.encode(np.asarray(spec.reference(decoded, case.scalars), dtype=np.float64)))

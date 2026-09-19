@@ -6,6 +6,7 @@ Workload-driven: `kopt run --op matmul --workload profile.json` where profile.js
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -59,7 +60,110 @@ def _build_parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show", help="print the best kernel found for an operator")
     show.add_argument("--op", required=True)
     show.add_argument("--out", type=Path, default=Path("results"))
+
+    workload = subparsers.add_parser("workload", help="build a workload profile from a profiler trace (CSV / JSONL / JSON)")
+    workload.add_argument("--trace", type=Path, required=True, help="trace file; one row per call (or with a count column)")
+    workload.add_argument("--op", default=None, help="keep only rows whose op/operator/kernel column equals this name")
+    workload.add_argument("--dims", nargs="+", default=None, help="dimension column names in operator order, e.g. --dims M N K")
+    workload.add_argument("--profile", type=Path, required=True, help="where to write the profile JSON (input for `kopt run --workload`)")
+
+    export = subparsers.add_parser("export", help="(re)build the integration bundle of a finished run from results/<op>/")
+    export.add_argument("--op", required=True)
+    export.add_argument("--out", type=Path, default=Path("results"))
+    export.add_argument("--bundle-dir", type=Path, default=None, help="destination (default: results/<op>/bundle)")
     return parser
+
+
+def _command_workload(args: argparse.Namespace) -> int:
+    from kopt_agent.workload import ingest_trace, save_profile
+
+    try:
+        report = ingest_trace(args.trace, operator=args.op, dims=args.dims)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"error: cannot read trace {args.trace}: {error}", file=sys.stderr)
+        return 2
+    print(report.describe())
+    if report.profile is None:
+        print("error: no usable rows in the trace", file=sys.stderr)
+        return 1
+    path = save_profile(report.profile, args.profile)
+    print(f"profile written to {path}")
+    return 0
+
+
+def _command_export(args: argparse.Namespace) -> int:
+    from kopt_agent.backends import get_backend
+    from kopt_agent.bundle import BundleContext, export_bundle, load_bundle_inputs
+    from kopt_agent.candidate import Candidate
+    from kopt_agent.evaluator import TrialResult, TrialStatus
+    from kopt_agent.history import History
+    from kopt_agent.spec import WorkloadEntry, WorkloadProfile
+    from ops import build_operator
+
+    operator_dir = args.out / args.op
+    try:
+        summary, source = load_bundle_inputs(operator_dir)
+    except FileNotFoundError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if not summary.get("best"):
+        print(f"error: the run in {operator_dir} found no correct kernel; nothing to export", file=sys.stderr)
+        return 1
+    workload = None
+    if summary.get("workload"):
+        workload = WorkloadProfile([WorkloadEntry(tuple(entry["shape"]), int(entry["count"])) for entry in summary["workload"]])
+    try:
+        bundle = build_operator(
+            summary["operator"], tuple(summary["shape"]), dtype=summary.get("dtype", "fp32"), workload=workload,
+            output_dtype=summary.get("output_dtype"), accumulate_dtype=summary.get("accumulate_dtype"),
+        )
+    except (KeyError, ValueError) as error:
+        print(f"error: cannot rebuild the operator spec from summary.json: {error}", file=sys.stderr)
+        return 1
+    best = dict(summary["best"])
+    best["status"] = TrialStatus(best["status"])
+    result = TrialResult(**best)
+    record = summary.get("best_candidate") or {}
+    candidate = Candidate(
+        source=source, origin=record.get("origin", result.origin), params=record.get("params", result.params),
+        extra_compile_flags=tuple(record.get("extra_compile_flags", ())), note=record.get("note", ""),
+        fast_path_predicate=record.get("fast_path_predicate"),
+    )
+    backend_name = summary.get("backend", "cpu_c")
+    compile_command = None
+    launch_abi = summary.get("launch_abi")
+    try:
+        backend = get_backend(backend_name)
+        compile_command = backend.portable_compile_command()
+        launch_abi = launch_abi or backend.launch_abi.to_dict()
+    except (KeyError, RuntimeError):
+        pass
+    # A throw-away History only for its parity-test / compile-command helpers: do not touch trials.jsonl.
+    history = History.__new__(History)
+    history.output_dir = operator_dir
+    history.spec = bundle.spec
+    history.compile_command = compile_command or []
+    baseline = None
+    trials_path = operator_dir / "trials.jsonl"
+    if trials_path.exists():
+        for line in trials_path.read_text(encoding="utf-8").splitlines():
+            try:
+                record_dict = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record_dict.get("origin") == "baseline" and record_dict.get("status") == TrialStatus.OK.value:
+                record_dict.pop("note", None)
+                record_dict["status"] = TrialStatus.OK
+                baseline = TrialResult(**record_dict)
+                break
+    context = BundleContext(backend_name=backend_name, launch_abi=launch_abi or {}, hardware=summary.get("hardware", "unknown"),
+                            baseline=baseline, verdict=summary.get("verdict"), peaks=summary.get("peaks"),
+                            extra={"fusion_gain": summary["fusion_gain"]} if summary.get("fusion_gain") else {})
+    directory = export_bundle(history, candidate, result, context, directory=args.bundle_dir)
+    print(f"bundle written to {directory}")
+    for name in sorted(path.name for path in directory.iterdir()):
+        print(f"  {name}")
+    return 0
 
 
 def _command_list_ops() -> int:
@@ -167,6 +271,8 @@ def _command_run(args: argparse.Namespace) -> int:
         best_candidate, best_result = history.best
         print(f"\nbest: trial {best_result.trial_id} ({best_candidate.short_label()}, {best_result.numeric_grade}) -> {history.output_dir / 'best.c'}")
         print(f"parity test: {history.output_dir / 'parity_test.py'}")
+        if agent.bundle_dir is not None:
+            print(f"integration bundle: {agent.bundle_dir} (kernel.c, kernel.h, manifest.json, build.sh, parity_test.py, README.md)")
     print(f"trial log: {history.trials_path}")
     return 0
 
@@ -177,6 +283,10 @@ def main(argv: list[str] | None = None) -> int:
         return _command_list_ops()
     if args.command == "show":
         return _command_show(args)
+    if args.command == "workload":
+        return _command_workload(args)
+    if args.command == "export":
+        return _command_export(args)
     return _command_run(args)
 
 
