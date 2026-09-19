@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from kopt_agent import cli
@@ -33,15 +35,29 @@ def backend():
 
 # ---- 4. integration bundle ------------------------------------------------------------------
 
+def _aligned_array(values: np.ndarray, alignment: int = 64) -> np.ndarray:
+    """Copy `values` into a buffer whose data pointer is `alignment`-byte aligned (the bundle's contract)."""
+    raw = np.empty(values.nbytes + alignment, dtype=np.uint8)
+    offset = (-raw.ctypes.data) % alignment
+    aligned = raw[offset:offset + values.nbytes].view(values.dtype).reshape(values.shape)
+    aligned[...] = values
+    return aligned
+
+
 def test_export_bundle_is_self_contained_and_builds(backend, tmp_path):
     bundle = build_operator("matmul", (24, 16, 8))
     evaluator = Evaluator(bundle.spec, backend, warmup=1, repeats=2, run_timeout_seconds=10)
     history = History(tmp_path / "matmul", spec=bundle.spec, compile_command=backend.portable_compile_command())
     baseline = Candidate(source=bundle.baseline_source, origin="baseline")
-    history.record(baseline, evaluator.evaluate(baseline))
+    baseline_result = evaluator.evaluate(baseline)
+    assert history.record(baseline, baseline_result), baseline_result.message  # first valid trial is always the champion
     candidate = bundle.select_template("blocked").render({"MB": 8, "NB": 64, "KB": 8, "THREADS": 1, "SCHEDULE": "static", "ALIGNED": 1})
     result = evaluator.evaluate(candidate)
-    assert history.record(candidate, result), result.message
+    # Correctness is deterministic; whether a blocked template out-times the naive loop on a 24x16x8
+    # problem is not. The export is therefore exercised on the candidate itself instead of being gated
+    # on it dethroning the baseline - export_bundle takes an explicit (candidate, result) pair anyway.
+    assert result.is_valid and result.is_benchmark_grade, result.message
+    history.record(candidate, result)
 
     context = BundleContext(backend_name=backend.name, launch_abi=backend.launch_abi.to_dict(), hardware="test box", baseline=history.baseline)
     directory = export_bundle(history, candidate, result, context)
@@ -68,11 +84,34 @@ def test_export_bundle_is_self_contained_and_builds(backend, tmp_path):
     assert "## Contract" in readme and "N % 16 == 0" in readme and "parity_test.py" in readme
     assert (directory / "kernel.c").read_text() == candidate.source
 
-    subprocess.run(["sh", str(directory / "build.sh")], check=True, capture_output=True)
-    assert (directory / "libkernel.so").exists()
+    # Independent build: ship the directory somewhere unrelated to the repository and to the run,
+    # compile it there with nothing but build.sh, then call the kernel through the documented ABI.
+    shipped = tmp_path / "downstream" / "vendor" / "matmul_kernel"
+    shutil.copytree(directory, shipped)
+    clean_env = {key: value for key, value in os.environ.items() if key not in ("KOPT_REPO", "PYTHONPATH")}
+    built = subprocess.run(["sh", str(shipped / "build.sh")], capture_output=True, text=True, env=clean_env, cwd=str(tmp_path / "downstream"))
+    assert built.returncode == 0, built.stdout + built.stderr
+    library_path = shipped / "libkernel.so"
+    assert library_path.exists() and "built" in built.stdout
 
+    library = ctypes.CDLL(str(library_path))
+    kernel = getattr(library, bundle.spec.symbol)
+    kernel.restype = None
+    kernel.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    rng = np.random.default_rng(7)
+    for m_dim, n_dim, k_dim in ((24, 16, 8), (7, 13, 5), (33, 48, 17)):
+        a_matrix = _aligned_array(rng.standard_normal((m_dim, k_dim), dtype=np.float32))
+        b_matrix = _aligned_array(rng.standard_normal((k_dim, n_dim), dtype=np.float32))
+        c_matrix = _aligned_array(np.full((m_dim, n_dim), np.nan, dtype=np.float32))
+        kernel(a_matrix.ctypes.data, b_matrix.ctypes.data, c_matrix.ctypes.data, m_dim, n_dim, k_dim)
+        expected = (a_matrix.astype(np.float64) @ b_matrix.astype(np.float64)).astype(np.float32)
+        np.testing.assert_allclose(c_matrix, expected, rtol=1e-5, atol=1e-5, err_msg=f"shape {m_dim}x{n_dim}x{k_dim}")
+        fast_path_flag = ctypes.c_int.in_dll(library, manifest["fast_path"]["flag_symbol"]).value
+        assert fast_path_flag == int(n_dim % 16 == 0), f"fast-path flag mismatch for N={n_dim}"
+
+    # The shipped parity test recompiles kernel.c itself and re-grades it against the reference.
     env = {**os.environ, "KOPT_REPO": str(REPO)}
-    completed = subprocess.run([sys.executable, str(directory / "parity_test.py")], capture_output=True, text=True, env=env, cwd=str(tmp_path))
+    completed = subprocess.run([sys.executable, str(shipped / "parity_test.py")], capture_output=True, text=True, env=env, cwd=str(tmp_path))
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "parity OK" in completed.stdout
 
