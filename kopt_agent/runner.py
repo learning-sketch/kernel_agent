@@ -1,20 +1,16 @@
-"""Isolated kernel runner. Reads one JSON job from stdin, loads the shared object with ctypes,
-runs the kernel and prints one JSON line with the result.
+"""Isolated kernel runner for host (CPU) kernels. Reads one JSON job from stdin, loads the shared
+object with ctypes, runs the shared verification / timing protocol and prints one JSON line.
 
-Verification protocol (when `verify` is true):
-  1. output prefilled with 0xFF bytes (NaN)        -> saved as the result to compare
-  2. output prefilled with a poison value          -> must be bit-identical to run 1, so the
-     kernel neither depends on the previous buffer contents nor leaves poison behind
-  3. canary pages around every tensor and input snapshots are checked after each run
-  4. if the library exports `int kopt_fast_path_active`, its value after run 1 is reported
+The protocol itself (NaN + poison prefills, canary pages, const-input snapshots, fast-path flag
+readout, warmup, interleaved A/B timing, CPU/wall ratio) lives in `backends/protocol.py`; this
+file only supplies the host-memory `KernelSession` and the process boundary.
 
-Timing protocol (when `repeats` > 0): warmup, then timed calls. If an `ab` artifact is given
-the candidate and the reference kernel are called alternately in the same process so slow
-drift (frequency, noisy neighbours) hits both equally. CPU time is sampled around the timed
-block so the caller can see whether the kernel actually kept its threads busy.
+Because this process deliberately runs kernels that may crash, core dumps are disabled before
+anything is loaded: a few hundred crash-classified candidates would otherwise litter the
+working directory with multi-hundred-MB `core` files.
 
-Kept dependency-free on the rest of the package so a crash here is always attributable to
-the generated kernel, not to the agent.
+Kept dependency-free on the rest of the package (numpy + protocol.py only) so a crash here is
+always attributable to the generated kernel, not to the agent.
 """
 
 from __future__ import annotations
@@ -24,38 +20,31 @@ import json
 import os
 import sys
 import time
+from typing import Any, Sequence
 
 import numpy as np
 
-ALIGNMENT_BYTES = 64
-GUARD_BYTES = 4096
-GUARD_PATTERN = 0xA5
-POISON_BYTE = 0x5C  # 0x5C5C5C5C as float32 = 2.48e17, as fp16 0x5C5C = 279; never a plausible result
-FAST_PATH_SYMBOL = "kopt_fast_path_active"
+from kopt_agent.backends.protocol import (
+    FAST_PATH_SYMBOL,
+    TIMING_HOST_WALL,
+    GuardedBuffer,
+    LaunchJob,
+    ProtocolError,
+    run_protocol,
+)
 
 
-class GuardedBuffer:
-    """A 64-byte aligned tensor surrounded by canary pages."""
-
-    def __init__(self, shape: list[int] | tuple[int, ...], dtype: np.dtype) -> None:
-        nbytes = int(np.prod(shape)) * dtype.itemsize if len(shape) else dtype.itemsize
-        self._raw = np.empty(GUARD_BYTES + nbytes + GUARD_BYTES + ALIGNMENT_BYTES, dtype=np.uint8)
-        start = GUARD_BYTES + ((-(self._raw.ctypes.data + GUARD_BYTES)) % ALIGNMENT_BYTES)
-        self._front = self._raw[start - GUARD_BYTES : start]
-        self._back = self._raw[start + nbytes : start + nbytes + GUARD_BYTES]
-        self._front.fill(GUARD_PATTERN)
-        self._back.fill(GUARD_PATTERN)
-        self.bytes_view = self._raw[start : start + nbytes]
-        self.array = self.bytes_view.view(dtype).reshape(shape)
-
-    def intact(self) -> bool:
-        return bool((self._front == GUARD_PATTERN).all() and (self._back == GUARD_PATTERN).all())
-
-    @classmethod
-    def from_array(cls, array: np.ndarray) -> "GuardedBuffer":
-        buffer = cls(array.shape, array.dtype)
-        buffer.array[...] = array
-        return buffer
+def disable_core_dumps() -> None:
+    """RLIMIT_CORE = 0 for this process and everything it execs. No-op on platforms without
+    the resource module (Windows)."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - non-POSIX
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):  # pragma: no cover - hard limit already lower / not permitted
+        pass
 
 
 class LoadedKernel:
@@ -70,123 +59,113 @@ class LoadedKernel:
             self.fast_path_flag = None
 
 
+class HostSession:
+    """KernelSession over host memory: buffers are guarded numpy arrays, the launcher is the
+    kernel symbol itself (host pointers, no stream), the timer is the host wall clock."""
+
+    timing_source = TIMING_HOST_WALL
+
+    def __init__(self, pointer_count: int, scalar_count: int) -> None:
+        self.pointer_count = pointer_count
+        self.scalar_count = scalar_count
+
+    def load_kernel(self, artifact: str, symbol: str) -> LoadedKernel:
+        try:
+            return LoadedKernel(artifact, symbol, self.pointer_count, self.scalar_count)
+        except (OSError, AttributeError) as error:
+            raise ProtocolError(f"cannot load symbol '{symbol}' from {artifact}: {error}") from error
+
+    def upload(self, name: str, array: np.ndarray) -> GuardedBuffer:
+        return GuardedBuffer.from_array(array)
+
+    def allocate_output(self, shape: Sequence[int], dtype: np.dtype) -> GuardedBuffer:
+        return GuardedBuffer(shape, np.dtype(dtype))
+
+    def fill_bytes(self, buffer: GuardedBuffer, byte: int) -> None:
+        buffer.bytes_view.fill(byte)
+
+    def download(self, buffer: GuardedBuffer) -> np.ndarray:
+        return buffer.array
+
+    @staticmethod
+    def _arguments(inputs: Sequence[GuardedBuffer], output: GuardedBuffer, scalars: Sequence[int]) -> list[Any]:
+        pointers = [buffer.array.ctypes.data_as(ctypes.c_void_p) for buffer in inputs] + [output.array.ctypes.data_as(ctypes.c_void_p)]
+        return pointers + [ctypes.c_int(value) for value in scalars]
+
+    def launch(self, kernel: LoadedKernel, inputs: Sequence[GuardedBuffer], output: GuardedBuffer, scalars: Sequence[int]) -> None:
+        kernel.function(*self._arguments(inputs, output, scalars))
+
+    def timed_launch(self, kernel: LoadedKernel, inputs: Sequence[GuardedBuffer], output: GuardedBuffer, scalars: Sequence[int]) -> float:
+        arguments = self._arguments(inputs, output, scalars)
+        started = time.perf_counter_ns()
+        kernel.function(*arguments)
+        return (time.perf_counter_ns() - started) / 1e6
+
+    def fast_path_flag(self, kernel: LoadedKernel) -> int | None:
+        return None if kernel.fast_path_flag is None else int(kernel.fast_path_flag.value)
+
+    def reset_fast_path_flag(self, kernel: LoadedKernel) -> None:
+        if kernel.fast_path_flag is not None:
+            kernel.fast_path_flag.value = 0
+
+    def memory_violations(self, input_names: Sequence[str], inputs: Sequence[GuardedBuffer], output: GuardedBuffer) -> list[str]:
+        violations = [f"wrote outside input '{name}'" for name, buffer in zip(input_names, inputs) if not buffer.intact()]
+        if not output.intact():
+            violations.append("wrote outside the output buffer")
+        return violations
+
+    def threads_available(self) -> int:
+        return int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+
+    def close(self) -> None:
+        pass
+
+
 def _fail(message: str, kind: str = "runtime") -> int:
     print(json.dumps({"ok": False, "error_kind": kind, "error": message}))
     return 0
 
 
-def _memory_violations(names, buffers, snapshots, output_buffer) -> list[str]:
-    violations = []
-    for name, buffer, snapshot in zip(names, buffers, snapshots):
-        if not buffer.intact():
-            violations.append(f"wrote outside input '{name}'")
-        elif not np.array_equal(buffer.bytes_view, snapshot):
-            violations.append(f"modified const input '{name}'")
-    if not output_buffer.intact():
-        violations.append("wrote outside the output buffer")
-    return violations
-
-
-def _timed_calls(call, repeats: int) -> list[float]:
-    timings_ms: list[float] = []
-    for _ in range(repeats):
-        started = time.perf_counter_ns()
-        call()
-        timings_ms.append((time.perf_counter_ns() - started) / 1e6)
-    return timings_ms
-
-
 def main() -> int:
-    job = json.loads(sys.stdin.read())
-    scalar_count = len(job["scalars"])
-    pointer_count = len(job["input_names"]) + 1
+    disable_core_dumps()
+    job_data = json.loads(sys.stdin.read())
+    scalar_count = len(job_data["scalars"])
+    pointer_count = len(job_data["input_names"]) + 1
+    session = HostSession(pointer_count, scalar_count)
+
     try:
-        kernel = LoadedKernel(job["artifact"], job["symbol"], pointer_count, scalar_count)
-    except (OSError, AttributeError) as error:
-        return _fail(f"cannot load symbol '{job['symbol']}': {error}")
+        kernel = session.load_kernel(job_data["artifact"], job_data["symbol"])
+        reference_kernel = None
+        ab = job_data.get("ab")
+        if ab and int(job_data.get("repeats", 0)) > 0:
+            reference_kernel = session.load_kernel(ab["artifact"], ab["symbol"])
+    except ProtocolError as error:
+        return _fail(error.message, error.kind)
 
-    with np.load(job["inputs_path"]) as archive:
-        input_buffers = [GuardedBuffer.from_array(archive[name]) for name in job["input_names"]]
-    input_snapshots = [buffer.bytes_view.copy() for buffer in input_buffers]
-    output_buffer = GuardedBuffer(job["output_shape"], np.dtype(job["output_dtype"]))
-    output = output_buffer.array
+    with np.load(job_data["inputs_path"]) as archive:
+        inputs = [archive[name] for name in job_data["input_names"]]
 
-    pointers = [buffer.array.ctypes.data_as(ctypes.c_void_p) for buffer in input_buffers] + [output.ctypes.data_as(ctypes.c_void_p)]
-    scalars = [ctypes.c_int(value) for value in job["scalars"]]
+    job = LaunchJob(
+        inputs=inputs,
+        input_names=list(job_data["input_names"]),
+        output_shape=tuple(job_data["output_shape"]),
+        output_dtype=np.dtype(job_data["output_dtype"]),
+        scalars=[int(value) for value in job_data["scalars"]],
+        verify=bool(job_data.get("verify", True)),
+        warmup=int(job_data.get("warmup", 0)),
+        repeats=int(job_data.get("repeats", 0)),
+        reference_kernel=reference_kernel,
+    )
+    try:
+        result = run_protocol(session, kernel, job)
+    except ProtocolError as error:
+        return _fail(error.message, error.kind)
 
-    def call_candidate() -> None:
-        kernel.function(*pointers, *scalars)
-
-    result: dict = {"ok": True}
-
-    if job.get("verify", True):
-        # All-ones bytes decode to NaN in every float format (fp32/fp16/bf16), so unwritten cells show up as NaN.
-        output_buffer.bytes_view.fill(0xFF)
-        if kernel.fast_path_flag is not None:
-            kernel.fast_path_flag.value = 0
-        call_candidate()
-        violations = _memory_violations(job["input_names"], input_buffers, input_snapshots, output_buffer)
-        if violations:
-            return _fail("memory safety violation: " + "; ".join(violations), kind="memory")
-        first_output = output.copy()
-        result["fast_path_active"] = None if kernel.fast_path_flag is None else int(kernel.fast_path_flag.value)
-
-        output_buffer.bytes_view.fill(POISON_BYTE)
-        call_candidate()
-        violations = _memory_violations(job["input_names"], input_buffers, input_snapshots, output_buffer)
-        if violations:
-            return _fail("memory safety violation (poison run): " + "; ".join(violations), kind="memory")
-        itemsize = np.dtype(job["output_dtype"]).itemsize
-        element_bytes = output_buffer.bytes_view.reshape(-1, itemsize)
-        result["poison_left_in_output"] = bool(output.size and (element_bytes == POISON_BYTE).all(axis=1).any())
-        result["prefill_dependent"] = not np.array_equal(first_output.view(np.uint8), output.view(np.uint8))
-        np.save(job["output_path"], first_output)
-        if result["prefill_dependent"] and job.get("poison_output_path"):
-            np.save(job["poison_output_path"], output)
-
-    repeats = int(job.get("repeats", 0))
-    if repeats > 0:
-        ab = job.get("ab")
-        reference_call = None
-        if ab:
-            try:
-                reference = LoadedKernel(ab["artifact"], ab["symbol"], pointer_count, scalar_count)
-            except (OSError, AttributeError) as error:
-                return _fail(f"cannot load A/B reference kernel: {error}")
-            reference_call = lambda: reference.function(*pointers, *scalars)  # noqa: E731
-
-        for _ in range(int(job.get("warmup", 0))):
-            call_candidate()
-            if reference_call is not None:
-                reference_call()
-
-        cpu_before = time.process_time()
-        wall_before = time.perf_counter()
-        if reference_call is None:
-            candidate_ms = _timed_calls(call_candidate, repeats)
-            reference_ms: list[float] = []
-        else:
-            # Interleaved A/B. Each timed call is preceded by an untimed call of the same kernel:
-            # switching kernels changes the cache state and, on VMs, lets idle worker threads
-            # sleep, so a strictly alternating pattern penalises the kernel that runs second.
-            candidate_ms, reference_ms = [], []
-            for _ in range(repeats):
-                reference_call()
-                reference_ms.extend(_timed_calls(reference_call, 1))
-                call_candidate()
-                candidate_ms.extend(_timed_calls(call_candidate, 1))
-        wall_elapsed = time.perf_counter() - wall_before
-        cpu_elapsed = time.process_time() - cpu_before
-
-        result["timings_ms"] = candidate_ms
-        result["reference_timings_ms"] = reference_ms
-        # On a CPU backend host and device are the same clock; a GPU backend reports device
-        # (event) time here and host time separately.
-        result["host_timings_ms"] = candidate_ms
-        result["cpu_wall_ratio"] = (cpu_elapsed / wall_elapsed) if wall_elapsed > 0 else None
-        result["threads_available"] = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
-
-    print(json.dumps(result))
+    if result.output is not None:
+        np.save(job_data["output_path"], result.output)
+    if result.poison_output is not None and job_data.get("poison_output_path"):
+        np.save(job_data["poison_output_path"], result.poison_output)
+    print(json.dumps(result.to_payload()))
     return 0
 
 

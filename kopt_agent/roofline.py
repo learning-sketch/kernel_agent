@@ -271,6 +271,11 @@ def _run_probe(
 
 
 def measure_peaks(backend: Backend, use_cache: bool = True) -> MachinePeaks:
+    # Accelerator backends know their own peaks (datasheet or device probes); the C probes below
+    # only make sense for backends that run plain C on the host.
+    device_peaks = backend.measure_peaks()
+    if device_peaks is not None:
+        return device_peaks
     cache_path = _cache_path(backend)
     if use_cache and cache_path.exists():
         try:

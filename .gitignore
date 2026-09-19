@@ -5,3 +5,7 @@ build/
 dist/
 results/
 .venv/
+.tox/
+# crash-classification runs deliberately segfault bad kernels; never commit their cores
+core
+core.*

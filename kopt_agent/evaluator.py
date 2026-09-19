@@ -98,6 +98,10 @@ class TrialResult:
     cpu_wall_ratio: float | None = None
     thread_utilization: float | None = None
     host_bound: bool = False
+    # Which clock produced the latencies ("host_wall" on CPU, "device_timer" on accelerators) and
+    # the transfer time the backend reported outside of it.
+    timing_source: str = "host_wall"
+    transfer_ms: dict | None = None  # {"h2d": ms, "d2h": ms} from the verification run, if reported
     compile_seconds: float = 0.0
     params: dict = field(default_factory=dict)
     # "full" = benchmark-grade timing; "quick" = coarse screening timing (not eligible for best)
@@ -151,6 +155,7 @@ class _Verified:
     bitwise_match_rate: float
     fast_path: dict
     notes: list[str]
+    transfer_ms: dict | None = None
 
 
 class Evaluator:
@@ -283,6 +288,7 @@ class Evaluator:
         failures: list[str] = []
         passed_labels: list[str] = []
         fast_path = {"declared": candidate.fast_path_predicate is not None, "activated_on": [], "missing_on": [], "unexpected_on": []}
+        transfer_ms: dict | None = None
 
         # Cheap edge shapes first so an out-of-bounds tile loop fails before the big run.
         for case in sorted(self.cases, key=lambda c: c.output.numel):
@@ -290,6 +296,8 @@ class Evaluator:
                 compiled.artifact, self.spec, case, self.case_inputs[case.label],
                 warmup=0, repeats=0, timeout_seconds=self.run_timeout_seconds, verify=True,
             )
+            if case.label == "primary" and run.ok and (run.h2d_ms is not None or run.d2h_ms is not None):
+                transfer_ms = {"h2d": run.h2d_ms, "d2h": run.d2h_ms}
             if not run.ok or run.output is None:
                 if run.error_kind == "memory":
                     failures.append(f"[{case.label}] {run.error}")
@@ -332,7 +340,9 @@ class Evaluator:
         if fast_path["declared"] and not fast_path["activated_on"]:
             notes.append("declared fast path never activated on any test shape (predicate false everywhere or flag never set)")
 
-        return _Verified(candidate, base, compiled.artifact, compiled, worst_error, worst_grade, worst_ulp, min_match_rate, fast_path, notes)
+        return _Verified(
+            candidate, base, compiled.artifact, compiled, worst_error, worst_grade, worst_ulp, min_match_rate, fast_path, notes, transfer_ms
+        )
 
     def _check_fast_path(self, candidate: Candidate, case: TestCase, run: RunResult, fast_path: dict) -> str | None:
         if candidate.fast_path_predicate is None:
@@ -464,6 +474,8 @@ class Evaluator:
             cpu_wall_ratio=cpu_wall_ratio,
             thread_utilization=thread_utilization,
             host_bound=host_bound,
+            timing_source=primary_run.timing_source if primary_run else "host_wall",
+            transfer_ms=verified.transfer_ms,
             timing_tier=tier,
             roofline=roofline,
             profile=profile.to_dict(),

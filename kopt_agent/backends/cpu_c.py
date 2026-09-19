@@ -21,12 +21,14 @@ from typing import Sequence
 
 import numpy as np
 
-from kopt_agent.backends.base import Backend, CompileResult, ProfileReport, RunResult
+from kopt_agent.backends.base import Backend, CompileResult, LaunchABI, ProfileReport, RunResult
+from kopt_agent.backends.protocol import TIMING_HOST_WALL
 from kopt_agent.candidate import Candidate
 from kopt_agent.dtypes import DType
 from kopt_agent.hardware import describe_cpu
 from kopt_agent.spec import OperatorSpec, TestCase
 
+PACKAGE_ROOT = Path(__file__).resolve().parents[2]  # directory that contains the `kopt_agent` package
 DEFAULT_FLAGS = ("-O3", "-march=native", "-fopenmp", "-shared", "-fPIC")
 # gcc's vectorizer diagnostics: which loops were vectorized and, more usefully, why others were not.
 OPT_REPORT_FLAGS = ("-fopt-info-vec-missed", "-fopt-info-vec-optimized")
@@ -39,6 +41,8 @@ OPTIONAL_LINK_LIBS = ("-lmvec",)
 
 class CpuCBackend(Backend):
     name = "cpu_c"
+    # The exported symbol *is* the kernel: host pointers, no stream, synchronous, host wall clock.
+    launch_abi = LaunchABI(pointer_space="host", stream_argument=False, synchronous_launch=True, fast_path_flag="global_int", entry_kind="kernel")
 
     def __init__(
         self,
@@ -62,7 +66,7 @@ class CpuCBackend(Backend):
     def supports_dtype(self, dtype: DType) -> bool:
         """Probe once whether the compiler accepts the element type with float conversions
         (gcc >= 12 for _Float16, gcc >= 13 for __bf16 on x86)."""
-        if dtype.name == "fp32":
+        if dtype.name in ("fp32", "fp64"):
             return True
         cached = self._dtype_support.get(dtype.name)
         if cached is not None:
@@ -173,6 +177,9 @@ class CpuCBackend(Backend):
         env = dict(os.environ)
         env.setdefault("OMP_NUM_THREADS", str(self.threads))
         env.setdefault("OMP_PROC_BIND", "true")
+        # The runner must import kopt_agent whatever the caller's cwd is and whether or not the
+        # package is installed: put the directory containing the package first on PYTHONPATH.
+        env["PYTHONPATH"] = os.pathsep.join(part for part in (str(PACKAGE_ROOT), env.get("PYTHONPATH", "")) if part)
 
         try:
             completed = subprocess.run(
@@ -215,6 +222,9 @@ class CpuCBackend(Backend):
             timings_ms=payload.get("timings_ms", []),
             host_timings_ms=payload.get("host_timings_ms", []),
             reference_timings_ms=payload.get("reference_timings_ms", []),
+            timing_source=payload.get("timing_source", TIMING_HOST_WALL),
+            h2d_ms=payload.get("h2d_ms"),
+            d2h_ms=payload.get("d2h_ms"),
             cpu_wall_ratio=payload.get("cpu_wall_ratio"),
             threads_available=payload.get("threads_available"),
             fast_path_active=payload.get("fast_path_active"),
@@ -234,7 +244,8 @@ class CpuCBackend(Backend):
             "listed in the hardware summary, <math.h>, <string.h>, <stdint.h>, <stdlib.h>. "
             "Do NOT define main(). Do not read files or environment variables. Every input pointer is "
             "row-major, contiguous, 64-byte aligned. Row strides equal the logical dimensions. "
-            "16-bit element types are spelled _Float16 (fp16) and __bf16 (bf16); convert to float for arithmetic. "
+            "16-bit element types are spelled _Float16 (fp16) and __bf16 (bf16); convert to the accumulation type for arithmetic. "
+            + self.launch_abi.describe() + ". "
             "If your kernel has a fast path that only handles some inputs (alignment, multiples of a tile, "
             "size thresholds), you MUST (a) keep a correct fallback for every other input, (b) declare the "
             "activation condition as a comment `// fast_path: <expression over the int scalars>` and (c) "
