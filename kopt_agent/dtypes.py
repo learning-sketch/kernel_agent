@@ -69,6 +69,7 @@ class DType:
 
 
 DTYPES: dict[str, DType] = {
+    "fp64": DType("fp64", "double", np.float64, 8, 52, NumericPolicy(atol=1e-9, rtol=1e-12, tight_ulp=16)),
     "fp32": DType("fp32", "float", np.float32, 4, 23, NumericPolicy(atol=1e-3, rtol=1e-4, tight_ulp=16)),
     # 16-bit acceptance is intentionally relative: results are compared against the fp64
     # reference rounded into the same 16-bit format.
@@ -82,3 +83,22 @@ def get_dtype(name: str) -> DType:
         return DTYPES[name]
     except KeyError as error:
         raise KeyError(f"unknown dtype '{name}', available: {sorted(DTYPES)}") from error
+
+
+def widest(*dtypes: DType) -> DType:
+    """The dtype with the most mantissa bits (ties keep the first)."""
+    if not dtypes:
+        raise ValueError("widest() needs at least one dtype")
+    return max(dtypes, key=lambda dtype: dtype.mantissa_bits)
+
+
+def default_accumulate_dtype(*io_dtypes: DType) -> DType:
+    """Accumulation precision when the operator does not pin one: at least fp32, and never
+    narrower than the widest input/output type (fp64 I/O accumulates in fp64)."""
+    return widest(DTYPES["fp32"], *io_dtypes)
+
+
+def math_suffix(dtype: DType) -> str:
+    """Suffix of the <math.h> family for arithmetic in `dtype` ("f" -> expf/fmaxf, "" -> exp/fmax).
+    16-bit types have no libm family; arithmetic in them is done in float."""
+    return "" if dtype.name == "fp64" else "f"

@@ -26,7 +26,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--op", required=True, help="operator name (see `kopt list-ops`)")
     run.add_argument("--shape", type=int, nargs="+", help="benchmark shape, e.g. --shape 512 512 512")
     run.add_argument("--workload", type=Path, default=None, help="JSON workload profile: (shape, call count) pairs; the objective becomes the call-weighted total time")
-    run.add_argument("--dtype", default="fp32", choices=sorted(DTYPES), help="element type of the operator")
+    run.add_argument("--dtype", default="fp32", choices=sorted(DTYPES), help="element type of the inputs")
+    run.add_argument("--output-dtype", default=None, choices=sorted(DTYPES), help="element type of the output (default: same as --dtype)")
+    run.add_argument("--accumulate-dtype", default=None, choices=sorted(DTYPES), help="accumulation precision (default: fp32, or fp64 for fp64 I/O)")
     run.add_argument("--allow-reduced-precision", action="store_true", help="let reduced-precision candidates win precision-sensitive operators")
     run.add_argument("--ceiling-fraction", type=float, default=0.85, help="declare 'at the ceiling' when best >= this fraction of the roofline-attainable time")
     run.add_argument("--no-stop-at-ceiling", action="store_true", help="keep searching even when the roofline verdict says the ceiling is reached")
@@ -107,7 +109,10 @@ def _command_run(args: argparse.Namespace) -> int:
 
     try:
         workload = WorkloadProfile.load(args.workload) if args.workload else None
-        bundle = build_operator(args.op, tuple(args.shape) if args.shape else None, dtype=args.dtype, workload=workload)
+        bundle = build_operator(
+            args.op, tuple(args.shape) if args.shape else None, dtype=args.dtype, workload=workload,
+            output_dtype=args.output_dtype, accumulate_dtype=args.accumulate_dtype,
+        )
     except (KeyError, ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

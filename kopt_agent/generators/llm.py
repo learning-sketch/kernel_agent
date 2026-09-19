@@ -211,8 +211,11 @@ class LLMGenerator:
             shape_text
             + "; correctness is also checked on edge shapes: "
             + ", ".join("x".join(map(str, shape)) for shape in spec.edge_shapes)
-            + f". Element type {spec.dtype.name} (C type `{spec.dtype.c_type}`); the reference is computed in fp64 and rounded to "
-            f"{spec.dtype.name}; acceptance atol={spec.atol}, rtol={spec.rtol}; results are graded bitwise-equal / within-N-ULP / "
+            + f". Precision: inputs {spec.dtype.name} (`{spec.dtype.c_type}`), output {spec.out_dtype.name} (`{spec.out_dtype.c_type}`), "
+            f"accumulate in {spec.acc_dtype.name} (`{spec.acc_dtype.c_type}`) - never reduce in a narrower type; per tensor: "
+            + ", ".join(f"{name}={dtype}" for name, dtype in spec.tensor_dtypes().items())
+            + f". The reference is computed in fp64 and rounded to {spec.out_dtype.name}; acceptance atol={spec.atol}, rtol={spec.rtol}; "
+            "results are graded bitwise-equal / within-N-ULP / "
             "reduced-precision. Output memory is prefilled with NaN and then with a poison pattern, so every element must be written "
             "and nothing may be read from the output before writing it."
             + (

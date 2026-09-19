@@ -100,12 +100,13 @@ class OptimizationAgent:
         self.config = config
         self.llm = llm
         self.template = bundle.select_template(config.template_name)
-        if not backend.supports_dtype(self.spec.dtype):
-            raise RuntimeError(
-                f"backend '{backend.name}' cannot compile {self.spec.dtype.name} kernels on this machine "
-                f"(the compiler rejects the C type '{self.spec.dtype.c_type}'; gcc >= 12 for _Float16, >= 13 for __bf16). "
-                "Use --dtype fp32 or a newer toolchain."
-            )
+        for dtype in self.spec.dtypes_used():
+            if not backend.supports_dtype(dtype):
+                raise RuntimeError(
+                    f"backend '{backend.name}' cannot compile {dtype.name} kernels on this machine "
+                    f"(the compiler rejects the C type '{dtype.c_type}'; gcc >= 12 for _Float16, >= 13 for __bf16). "
+                    f"Operator precision: {self.spec.precision_label()}. Use fp32 or a newer toolchain."
+                )
         self.hardware = backend.hardware_summary()
         self.peaks: MachinePeaks | None = None
         if config.roofline:
@@ -146,7 +147,8 @@ class OptimizationAgent:
     def run(self) -> History:
         started = time.perf_counter()
         logger.info(
-            "operator=%s dtype=%s shape=%s backend=%s%s", self.spec.name, self.spec.dtype.name, self.spec.primary_shape, self.backend.name,
+            "operator=%s precision=%s shape=%s backend=%s (%s)%s", self.spec.name, self.spec.precision_label(), self.spec.primary_shape,
+            self.backend.name, self.backend.launch_abi.describe(),
             " precision-sensitive" + ("" if self.config.allow_reduced_precision else " (reduced-precision candidates cannot win)") if self.spec.precision_sensitive else "",
         )
         logger.info("hardware: %s", self.hardware)

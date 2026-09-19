@@ -9,7 +9,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from kopt_agent.dtypes import DTYPES, DType, NumericPolicy
+from kopt_agent.dtypes import DTYPES, DType, NumericPolicy, default_accumulate_dtype
 
 
 @dataclass(frozen=True)
@@ -99,9 +99,11 @@ class WorkloadProfile:
 class OperatorSpec:
     """Everything the agent needs to know about one operator.
 
-    - `reference` is the ground truth, computed in float64 on the host from decoded inputs.
+    - `reference` is the ground truth, computed in float64 on the host from decoded inputs and
+      rounded to each output tensor's own dtype before comparison.
     - `make_case(shape, dtype)` builds a TestCase for a shape so the same kernel can be
-      checked on the benchmark shape, the workload shapes and awkward edge shapes.
+      checked on the benchmark shape, the workload shapes and awkward edge shapes. `dtype` is
+      the input element type; the case's TensorSpecs decide the type of every tensor.
     - `c_signature` is the exact function prototype every candidate must implement.
     """
 
@@ -116,8 +118,14 @@ class OperatorSpec:
     bytes_moved: Callable[[tuple[int, ...]], int]
     scalar_names: tuple[str, ...] = ()
     edge_shapes: tuple[tuple[int, ...], ...] = ()
+    # Mixed precision: `dtype` is the element type of the inputs (the "operator dtype");
+    # `output_dtype` may differ (e.g. bf16 in, fp32 out) and `accumulate_dtype` pins the
+    # precision of the reduction (defaults to at least fp32). Each TensorSpec carries its own
+    # dtype, so make_case may also assign per-tensor types beyond these two.
     dtype: DType = DTYPES["fp32"]
-    numeric_policy: NumericPolicy | None = None  # overrides dtype.policy when set
+    output_dtype: DType | None = None
+    accumulate_dtype: DType | None = None
+    numeric_policy: NumericPolicy | None = None  # overrides the output dtype's policy when set
     input_generator: Callable[[TensorSpec, np.random.Generator], np.ndarray] | None = None
     notes: list[str] = field(default_factory=list)
     workload: WorkloadProfile | None = None
@@ -127,8 +135,45 @@ class OperatorSpec:
     fused_stages: tuple[str, ...] = ()
 
     @property
+    def out_dtype(self) -> DType:
+        return self.output_dtype or self.dtype
+
+    @property
+    def acc_dtype(self) -> DType:
+        return self.accumulate_dtype or default_accumulate_dtype(self.dtype, self.out_dtype)
+
+    @property
+    def mixed_precision(self) -> bool:
+        return self.out_dtype.name != self.dtype.name or self.acc_dtype.name != default_accumulate_dtype(self.dtype, self.out_dtype).name
+
+    def dtypes_used(self) -> list[DType]:
+        """Distinct element types a kernel must be able to spell (inputs, output, accumulator)."""
+        seen: dict[str, DType] = {}
+        case = self.primary_case()
+        for tensor in (*case.inputs, case.output):
+            seen.setdefault(tensor.dtype.name, tensor.dtype)
+        for dtype in (self.dtype, self.out_dtype, self.acc_dtype):
+            seen.setdefault(dtype.name, dtype)
+        return list(seen.values())
+
+    def precision_label(self) -> str:
+        """Short human label: "fp32" or "bf16 -> fp32 (acc fp32)"."""
+        if not self.mixed_precision:
+            return self.dtype.name
+        return f"{self.dtype.name} -> {self.out_dtype.name} (acc {self.acc_dtype.name})"
+
+    def tensor_dtypes(self) -> dict[str, str]:
+        """Per-tensor element types of the primary case, by tensor name (inputs then output)."""
+        case = self.primary_case()
+        return {**{tensor.name: tensor.dtype.name for tensor in case.inputs}, case.output.name: case.output.dtype.name}
+
+    def primary_case(self) -> TestCase:
+        return self.make_case(self.primary_shape, self.dtype)
+
+    @property
     def policy(self) -> NumericPolicy:
-        return self.numeric_policy or self.dtype.policy
+        # Correctness is judged on what is stored, so the output type sets the tolerance.
+        return self.numeric_policy or self.out_dtype.policy
 
     @property
     def atol(self) -> float:

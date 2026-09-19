@@ -1,4 +1,11 @@
-"""GEMM: C[M,N] = A[M,K] @ B[K,N] in fp32, fp16 or bf16 (float accumulation)."""
+"""GEMM: C[M,N] = A[M,K] @ B[K,N].
+
+Precision is configurable per tensor: inputs in `dtype` (fp32 / fp16 / bf16 / fp64), the output in
+`output_dtype` (defaults to the input type) and the reduction in `accumulate_dtype` (defaults to
+fp32, or fp64 when any I/O tensor is fp64). The typical inference configuration
+`--dtype bf16 --output-dtype fp32 --accumulate-dtype fp32` is therefore one spec, graded with the
+same numeric grades as a uniform-precision kernel.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +14,7 @@ import os
 import numpy as np
 
 from kopt_agent.agent import OperatorBundle
-from kopt_agent.dtypes import DType, get_dtype
+from kopt_agent.dtypes import DType, default_accumulate_dtype, get_dtype
 from kopt_agent.generators.template import TemplateGenerator
 from kopt_agent.spec import OperatorSpec, TensorSpec, TestCase, WorkloadProfile
 from ops.matmul_packed import build_packed_template
@@ -16,25 +23,29 @@ DEFAULT_SHAPE = (512, 512, 512)
 SYMBOL = "matmul_kernel"
 
 
-def signature(dtype: DType) -> str:
-    c_type = dtype.c_type
-    return f"void {SYMBOL}(const {c_type}* A, const {c_type}* B, {c_type}* C, int M, int N, int K)"
+def signature(dtype: DType, out_dtype: DType | None = None) -> str:
+    out_dtype = out_dtype or dtype
+    return f"void {SYMBOL}(const {dtype.c_type}* A, const {dtype.c_type}* B, {out_dtype.c_type}* C, int M, int N, int K)"
 
 
-def baseline_source(dtype: DType) -> str:
+def baseline_source(dtype: DType, out_dtype: DType | None = None, acc_dtype: DType | None = None) -> str:
+    out_dtype = out_dtype or dtype
+    acc_dtype = acc_dtype or default_accumulate_dtype(dtype, out_dtype)
     return f"""#include <stddef.h>
 
-typedef {dtype.c_type} elem_t;
+typedef {dtype.c_type} in_t;
+typedef {out_dtype.c_type} out_t;
+typedef {acc_dtype.c_type} acc_t;
 
 /* Naive triple loop. Correct, cache-hostile (B is walked with stride N). */
-{signature(dtype)} {{
+{signature(dtype, out_dtype)} {{
     for (int i = 0; i < M; i++) {{
         for (int j = 0; j < N; j++) {{
-            float acc = 0.0f;
+            acc_t acc = (acc_t)0;
             for (int k = 0; k < K; k++) {{
-                acc += (float)A[(size_t)i * K + k] * (float)B[(size_t)k * N + j];
+                acc += (acc_t)A[(size_t)i * K + k] * (acc_t)B[(size_t)k * N + j];
             }}
-            C[(size_t)i * N + j] = (elem_t)acc;
+            C[(size_t)i * N + j] = (out_t)acc;
         }}
     }}
 }}
@@ -99,11 +110,11 @@ int kopt_fast_path_active = 0;
 )
 
 
-def make_case(shape: tuple[int, ...], dtype: DType) -> TestCase:
+def make_case(shape: tuple[int, ...], dtype: DType, out_dtype: DType | None = None) -> TestCase:
     rows, cols, depth = shape
     return TestCase(
         inputs=(TensorSpec("A", (rows, depth), dtype), TensorSpec("B", (depth, cols), dtype)),
-        output=TensorSpec("C", (rows, cols), dtype),
+        output=TensorSpec("C", (rows, cols), out_dtype or dtype),
         scalars=(rows, cols, depth),
     )
 
@@ -117,36 +128,53 @@ def flops(shape: tuple[int, ...]) -> int:
     return 2 * shape[0] * shape[1] * shape[2]
 
 
-def build(shape: tuple[int, ...], dtype: str = "fp32", workload: WorkloadProfile | None = None) -> OperatorBundle:
+def build(
+    shape: tuple[int, ...],
+    dtype: str = "fp32",
+    workload: WorkloadProfile | None = None,
+    output_dtype: str | None = None,
+    accumulate_dtype: str | None = None,
+) -> OperatorBundle:
     rows, cols, depth = shape
     element = get_dtype(dtype)
-    itemsize = element.itemsize
+    out_element = get_dtype(output_dtype) if output_dtype else element
+    acc_element = get_dtype(accumulate_dtype) if accumulate_dtype else default_accumulate_dtype(element, out_element)
+    in_size, out_size = element.itemsize, out_element.itemsize
+
+    def bytes_moved(s: tuple[int, ...]) -> int:
+        return in_size * (s[0] * s[2] + s[2] * s[1]) + out_size * s[0] * s[1]
+
     spec = OperatorSpec(
         name="matmul",
-        description=f"C[M,N] = A[M,K] @ B[K,N] for row-major {element.name} matrices (accumulate in float); C must be fully overwritten (not accumulated).",
-        c_signature=signature(element),
+        description=(
+            f"C[M,N] = A[M,K] @ B[K,N] for row-major matrices: A, B in {element.name}, C in {out_element.name}, "
+            f"accumulate in {acc_element.name}; C must be fully overwritten (not accumulated)."
+        ),
+        c_signature=signature(element, out_element),
         symbol=SYMBOL,
         primary_shape=shape,
-        make_case=make_case,
+        make_case=lambda s, in_dtype: make_case(s, in_dtype, out_element),
         reference=reference,
         flops=flops,
-        bytes_moved=lambda s: itemsize * (s[0] * s[2] + s[2] * s[1] + s[0] * s[1]),
+        bytes_moved=bytes_moved,
         scalar_names=("M", "N", "K"),
         # Prime and tiny sizes defeat every "assume multiple of tile" shortcut; 48 columns is a
         # multiple of 16 but not of 64, so an "N % 16" fast path must still handle it.
         edge_shapes=((1, 1, 1), (7, 13, 5), (33, 65, 17), (64, 1, 128), (1, 129, 3), (24, 48, 40)),
         dtype=element,
+        output_dtype=out_element,
+        accumulate_dtype=acc_element,
         workload=workload,
         precision_sensitive=False,
         notes=[
             "A, B and C are distinct buffers (no aliasing).",
-            f"Benchmark arithmetic intensity is high ({flops(shape) / (itemsize * (rows * depth + depth * cols + rows * cols)):.0f} FLOP/byte) so the kernel is compute bound: register tiling + FMA vectorization matter most.",
-        ]
-        + (["Accumulate in float and round to the element type only when storing C."] if element.name != "fp32" else []),
+            f"Benchmark arithmetic intensity is high ({flops(shape) / bytes_moved(shape):.0f} FLOP/byte) so the kernel is compute bound: register tiling + FMA vectorization matter most.",
+            f"Accumulate in {acc_element.c_type} and round to {out_element.c_type} only when storing C.",
+        ],
     )
 
-    templates = {"packed": build_packed_template(signature(element), element)}
-    if element.name == "fp32":
+    templates = {"packed": build_packed_template(signature(element, out_element), element, out_dtype=out_element, acc_dtype=acc_element)}
+    if element.name == "fp32" and out_element.name == "fp32" and acc_element.name == "fp32":
         thread_options = sorted({1, 2, max(1, (os.cpu_count() or 1) // 2), os.cpu_count() or 1})
         templates["blocked"] = TemplateGenerator(
             template_source=BLOCKED_TEMPLATE_SOURCE,
@@ -165,7 +193,7 @@ def build(shape: tuple[int, ...], dtype: str = "fp32", workload: WorkloadProfile
         )
     return OperatorBundle(
         spec=spec,
-        baseline_source=baseline_source(element),
+        baseline_source=baseline_source(element, out_element, acc_element),
         templates=templates,
         default_template="packed",
     )

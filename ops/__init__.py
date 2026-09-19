@@ -23,21 +23,26 @@ def build_operator(
     shape: tuple[int, ...] | None,
     dtype: str = "fp32",
     workload: WorkloadProfile | None = None,
+    output_dtype: str | None = None,
+    accumulate_dtype: str | None = None,
 ) -> OperatorBundle:
+    """`dtype` is the input element type; `output_dtype` / `accumulate_dtype` (names) select a
+    mixed-precision variant, e.g. bf16 inputs, fp32 output, fp32 accumulation."""
     if name not in OP_REGISTRY:
         raise KeyError(f"unknown operator '{name}', available: {sorted(OP_REGISTRY)}")
     builder, default_shape, _ = OP_REGISTRY[name]
+    precision = {"dtype": dtype, "output_dtype": output_dtype, "accumulate_dtype": accumulate_dtype}
     if workload is not None:
         for entry in workload.entries:
             if len(entry.shape) != len(default_shape):
                 raise ValueError(f"workload shape {entry.shape} has {len(entry.shape)} dims, operator '{name}' expects {len(default_shape)}")
         if shape is None:
             # Primary (display) shape = the one that consumes the most work in the trace.
-            probe = builder(workload.entries[0].shape, dtype=dtype)
+            probe = builder(workload.entries[0].shape, **precision)
             shape = workload.dominant_shape(probe.spec.flops)
     chosen_shape = tuple(shape or default_shape)
     if len(chosen_shape) != len(default_shape):
         raise ValueError(f"operator '{name}' expects {len(default_shape)} dims, got {chosen_shape}")
     if any(dim <= 0 for dim in chosen_shape):
         raise ValueError(f"all dims must be positive, got {chosen_shape}")
-    return builder(chosen_shape, dtype=dtype, workload=workload)
+    return builder(chosen_shape, workload=workload, **precision)
